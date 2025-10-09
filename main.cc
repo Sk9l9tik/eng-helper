@@ -5,6 +5,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <tesseract/publictypes.h>
+#include <utility>
 #include <vector>
 #include <fstream>
 #include <set>
@@ -33,6 +34,7 @@ cv::Mat make_screenshot() {
 int main() {
     std::vector<std::string> words;
     std::set<std::string> blocks;
+    std::vector<std::pair<std::pair<int, int>, std::pair<int, int>>> coordinates;
 
     cv::Mat img = make_screenshot();
 
@@ -45,7 +47,6 @@ int main() {
         std::cerr << "Couldn't initialize tesseract." << '\n';
         return 1;
     }
-    // ocr->SetVariable("tessedit_char_whitelist", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\"!?.,;:-_()[]{}<>'`~@#$%^&*+=/\\| ");
     ocr->SetPageSegMode(tesseract::PSM_AUTO);
 
     cv::Mat img_rgb;
@@ -90,6 +91,8 @@ int main() {
             // Draw rectangle
             cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 255), 1);
             //cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 255, 0.5), cv::FILLED);
+            
+            coordinates.emplace_back(std::make_pair(x1, y1), std::make_pair(x2, y2));
 
             // Optionally show the word
             if (word) {
@@ -105,10 +108,18 @@ int main() {
 
     std::ofstream all_words("all_words.txt");
 
-    std::for_each(blocks.begin(), blocks.end(), [&all_words](const std::string& word){
-            all_words << word << '\n';
+    std::for_each(blocks.begin(), blocks.end(), [&all_words](const std::string& block){
+            all_words << block << '\n';
     });
 
+    std::for_each(coordinates.begin(), coordinates.end(), [&all_words](const auto& coordinate){
+            auto [p1, p2] = coordinate;
+            auto [x1, y1] = p1;
+            auto [x2, y2] = p2;
+
+            all_words << x1 << ' ' << y1 << '\n';
+            all_words << x2 << ' ' << y2 << "\n\n";
+    });
 
     cv::imwrite("screenshot_highlighted.png", img);
 

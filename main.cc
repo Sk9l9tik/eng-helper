@@ -1,133 +1,215 @@
-#include <tesseract/baseapi.h>
-#include <leptonica/allheaders.h>
-#include <opencv2/opencv.hpp>
-
 #include <iostream>
 #include <cstdlib>
+#include <memory>
+#include <stdexcept>
 #include <tesseract/publictypes.h>
+#include <tesseract/resultiterator.h>
 #include <utility>
 #include <vector>
 #include <fstream>
-#include <set>
+#include <string>
 
-cv::Mat make_screenshot() {
-    std::string output("screenshot.png");
-    std::string command("grim - | convert - -shave 1x1 PNG:- | wl-copy && wl-paste >" + output );
+#include <tesseract/baseapi.h>
+#include <leptonica/allheaders.h>
+#include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp>
 
-    int ret = std::system (command.c_str());
+// TODO: wrap to namespace 
 
-    if (ret != 0) {
-        std::cerr << "Error taking screenshot" << '\n';
-        return cv::Mat();
-    }
+struct Rect {
+    int x1, y1, x2, y2;
 
-    cv::Mat img = cv::imread(output);
+    Rect(int x1, int y1, int x2, int y2) : x1(x1), y1(y1), x2(x2), y2(y2) {}
+    Rect() : x1(0), y1(0), x2(0), y2(0) {}
+};
 
-    if(img.empty()) {
-        std::cerr << "Error loading image" <<  '\n';
-        return cv::Mat();
-    }
+struct Block {
+   int id;
+   std::string text;
+   Rect box;
 
-    return img;
-}
+   Block(int id_, std::string text_, Rect box_) : id(id_), text(text_), box(box_) {};
+   Block() : id(0), text(""), box({}) {};
+};
 
-int main() {
-    std::vector<std::string> words;
-    std::set<std::string> blocks;
-    std::vector<std::pair<std::pair<int, int>, std::pair<int, int>>> coordinates;
+struct Word{
+    std::string text;
+    Rect box;
+    int block_id;
+    float confidence;
 
-    cv::Mat img = make_screenshot();
+   // Word(int id_, std::string text_, Rect box_) : id(id_), text(text_), box(box_) {};
+   // Word() : id(0), text(""), box({}) {};
+};
 
-    if(img.empty()){
-        return 1;
-    }
-
-    tesseract::TessBaseAPI * ocr = new tesseract::TessBaseAPI();
-    if (ocr->Init(NULL, "eng")){
-        std::cerr << "Couldn't initialize tesseract." << '\n';
-        return 1;
-    }
-    ocr->SetPageSegMode(tesseract::PSM_AUTO);
-
-    cv::Mat img_rgb;
-    cv::cvtColor(img, img_rgb, cv::COLOR_BGR2RGB);
-
-    ocr->SetImage(img_rgb.data, img_rgb.cols, img_rgb.rows, 3, img_rgb.step);
-
-    ocr->Recognize(0);
-    tesseract::ResultIterator* ri = ocr->GetIterator();
-    tesseract::PageIteratorLevel level = tesseract::RIL_WORD;
-
-    tesseract::ResultIterator* pi = ocr->GetIterator();
-
-
-    if (ri != nullptr) {
-        do {
-            const char* word = ri->GetUTF8Text(level);
-            float conf = ri->Confidence(level);
-
-            //word coordinates
-            int x1, y1, x2, y2;
-            ri->BoundingBox(level, &x1, &y1, &x2, &y2);
-
-            //block coordinates
-            int bx1, by1, bx2, by2;
-            pi->BoundingBox(tesseract::RIL_BLOCK, &bx1, &by1, &bx2, &by2);
-
-
-            bool word_in_block = (x1 >= bx1) && (y1 >= by1) && (x2 <= bx2) && (y2 <= by2);
-
-
-            if(!word_in_block){
-                blocks.emplace(ri->GetUTF8Text(tesseract::RIL_BLOCK));
-                // std::cout << ri->GetUTF8Text(tesseract::RIL_BLOCK) << '\n';
-            }
-            else if(!pi){
-                pi->Next(tesseract::RIL_BLOCK);
-            }
-
-
-
-            // Draw rectangle
-            cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 255), 1);
-            //cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 255, 0.5), cv::FILLED);
+class Parser {
+public:
+    explicit Parser(const cv::Mat& image, const std::string& tesseract_data_path = "", const std::string& lang = "eng")
+        : img_original_(image), api_(nullptr, [](tesseract::TessBaseAPI* p){ if (p) { p->End(); delete p;} }) {
+            if (img_original_.empty())
+                throw std::runtime_error("Empty image passed to Parser");
             
-            coordinates.emplace_back(std::make_pair(x1, y1), std::make_pair(x2, y2));
-
-            // Optionally show the word
-            if (word) {
-                words.emplace_back(word);
-
-                cv::putText(img, word, cv::Point(x1, y1 - 5),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
-                delete[] word;
+            tesseract::TessBaseAPI* raw = new tesseract::TessBaseAPI();
+            if (raw->Init(tesseract_data_path.empty() ? NULL : tesseract_data_path.c_str(), lang.c_str())){
+                delete raw;
+                throw std::runtime_error("Failed to initialize tesseract API");
             }
+            api_.reset(raw);
 
-        } while (ri->Next(level));
+            if (img_original_.channels() == 4) {
+                cv::cvtColor(img_original_, img_rgb_, cv::COLOR_BGRA2RGB);
+            }
+            else if (img_original_.channels() == 3) {
+                cv::cvtColor(img_original_, img_rgb_, cv::COLOR_BGR2RGB);
+            }
+            else if (img_original_.channels() == 1) {
+                cv::cvtColor(img_original_, img_rgb_, cv::COLOR_GRAY2RGB);
+            }
+            else {
+                throw std::runtime_error("Unsupported number of channels in image");
+            }
+        }
+
+    const std::vector<Block>& get_blocks() const { return blocks_; }
+    const std::vector<Word>& get_words() const { return words_; }
+
+    // start pipeline
+    void process(){
+        set_image_to_api();
+        recognize();
+        extract_blocks();
+        extract_words_and_map_to_blocks();
     }
 
-    std::ofstream all_words("all_words.txt");
 
-    std::for_each(blocks.begin(), blocks.end(), [&all_words](const std::string& block){
-            all_words << block << '\n';
-    });
+    void save_detected_words(const std::string& filename) const {
+        std::ofstream ofs(filename);
+        if(!ofs) throw std::runtime_error("Cannot open output file");
 
-    std::for_each(coordinates.begin(), coordinates.end(), [&all_words](const auto& coordinate){
-            auto [p1, p2] = coordinate;
-            auto [x1, y1] = p1;
-            auto [x2, y2] = p2;
 
-            all_words << x1 << ' ' << y1 << '\n';
-            all_words << x2 << ' ' << y2 << "\n\n";
-    });
+        ofs << "Blocks:\n";
+        for (const auto& b : blocks_) {
+            ofs << b.id << ": (" << b.box.x1 << "," << b.box.y1 << ") - (" << b.box.x2 << "," << b.box.y2 << ")\n";
+            ofs << b.text << "\n---\n";
+        }
 
-    cv::imwrite("screenshot_highlighted.png", img);
 
-    ocr->End();
+        ofs << "\nWords:\n";
+        for (const auto& w : words_) {
+            ofs << "block_id=" << w.block_id << " conf=" << w.confidence << " text=\"" << w.text << "\"\n";
+            ofs << w.box.x1 << " " << w.box.y1 << "\n";
+            ofs << w.box.x2 << " " << w.box.y2 << "\n\n";
+        }
+    }
+private:
+    void set_image_to_api(){
+        api_->SetImage(img_rgb_.data, img_rgb_.cols, img_rgb_.rows, img_rgb_.channels(), static_cast<int>(img_rgb_.step));
+    }
 
-    cv::imshow("screenshot", img);
+    void recognize(){
+        api_->SetPageSegMode(tesseract::PSM_AUTO);
+        if(api_->Recognize(0) != 0)
+            throw std::runtime_error("Tesseract recognize failed");
+    }
 
-    cv::waitKey(0);
+
+    using TesseractString = std::unique_ptr<char, void(*)(void*)>;
+    TesseractString make_text(char* p) {
+        return TesseractString(p, [](void* mem){ delete[] static_cast<char*>(mem); });
+    }
+
+    void extract_blocks(){
+        blocks_.clear();
+        std::unique_ptr<tesseract::ResultIterator> it(api_->GetIterator());
+        if (!it) return;
+
+        tesseract::PageIteratorLevel level = tesseract::RIL_PARA;
+        int block_id{};
+
+        do {
+            auto block_text = make_text(it->GetUTF8Text(level));
+
+            if (block_text){
+                int x1, y1, x2, y2;
+                if (it->BoundingBox(level, &x1, &y1, &x2, &y2)) {
+                    Block b;
+                    b.id = block_id++;
+                    b.box = Rect(x1, y1, x2, y2);
+                    b.text = block_text ? std::string(block_text.get()) : "";
+                    blocks_.emplace_back(b);
+                }
+            }
+
+        } while (it->Next(level));
+    }
+
+
+    void extract_words_and_map_to_blocks() {
+        words_.clear();
+
+        std::unique_ptr<tesseract::ResultIterator> it(api_->GetIterator());
+        if (!it) return;
+
+        tesseract::PageIteratorLevel level = tesseract::RIL_WORD;
+
+        do {
+            auto word_text = make_text(it->GetUTF8Text(level));
+
+            float conf = it->Confidence(level);
+
+            int x1, y1, x2, y2;
+            bool has_box = it->BoundingBox(level, &x1, &y1, &x2, &y2);
+
+            // READ: This check is real need?
+            if (!has_box) {
+                if (word_text) word_text.get_deleter();
+                continue;
+            }
+
+            Word w;
+            w.text = word_text ? std::string(word_text.get()) : "";
+            w.box = Rect(x1, y1, x2, y2);
+            w.confidence = conf;
+            w.block_id = find_block_for_word(w);
+
+            words_.emplace_back(std::move(w));
+
+            if (word_text) word_text.get_deleter();
+        }
+        while (it->Next(level));
+    }
+
+    int find_block_for_word(const Word& w){
+        double cx = (w.box.x1 + w.box.x2) / 2.0;
+        double cy = (w.box.y1 + w.box.y2) / 2.0;
+
+        for (const auto& b : blocks_)
+            if (cx >= b.box.x1 && cx <= b.box.x2 && cy >= b.box.y1 && cy <= b.box.y2) 
+                return b.id;
+
+        return -1;
+    }
+
+private:
+    cv::Mat img_original_;  // BGR
+    cv::Mat img_rgb_;       //RGB
+
+    std::unique_ptr<tesseract::TessBaseAPI, void(*)(tesseract::TessBaseAPI*)> api_;
+
+    std::vector<Block> blocks_;
+    std::vector<Word> words_;
+};
+
+
+int main(){
+
+    cv::Mat img = cv::imread("/home/alex/opencv_test/build/-screenshot.png");
+    Parser p(img);
+
+    p.process();
+
+    p.save_detected_words("all_words.txt");
 
     return 0;
 }
+

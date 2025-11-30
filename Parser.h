@@ -17,7 +17,7 @@
 #include <tesseract/publictypes.h>
 #include <tesseract/resultiterator.h>
 
-// TODO: wrap to namespace 
+// TODO: wrap this code into namespace 
 
 struct Rect {
     int x1, y1, x2, y2;
@@ -28,11 +28,12 @@ struct Rect {
 
 struct Block {
    int id;
+   std::vector<std::string> words;
    std::string text;
    Rect box;
 
-   Block(int id_, std::string text_, Rect box_) : id(id_), text(text_), box(box_) {};
-   Block() : id(0), text(""), box({}) {};
+   Block(int id_, std::string text_, Rect box_) : id(id_), words{text_}, text{text_}, box(box_) {};
+   Block() : id(0), text(), box({}), words{} {};
 };
 
 struct Word{
@@ -93,7 +94,8 @@ public:
         ofs << "Blocks:\n";
         for (const auto& b : blocks_) {
             ofs << b.id << ": (" << b.box.x1 << "," << b.box.y1 << ") - (" << b.box.x2 << "," << b.box.y2 << ")\n";
-            ofs << b.text << "\n---\n";
+            ofs << [&b](){std::string s; for(auto& it : b.text) s+= it; return s;}() << "\n---\n";
+            // ofs << b.text << "\n---\n";
         }
 
 
@@ -126,8 +128,7 @@ private:
         std::unique_ptr<tesseract::ResultIterator> it(api_->GetIterator());
         if (!it) return;
 
-        tesseract::PageIteratorLevel level = tesseract::RIL_PARA;
-        int block_id{};
+        tesseract::PageIteratorLevel level = tesseract::RIL_BLOCK; int block_id{};
 
         do {
             auto block_text = make_text(it->GetUTF8Text(level));
@@ -139,6 +140,16 @@ private:
                     b.id = block_id++;
                     b.box = Rect(x1, y1, x2, y2);
                     b.text = block_text ? std::string(block_text.get()) : "";
+                    b.words = [&b](){
+                        std::vector<std::string> v;
+                        std::string s = b.text;
+                        std::istringstream ss(s);
+                        std::string tmp;
+                        while(ss >> tmp){
+                            v.emplace_back(tmp);
+                        }
+                        return v;
+                    }();
                     blocks_.emplace_back(b);
                 }
             }
@@ -171,7 +182,7 @@ private:
 
             Word w;
             w.text = word_text ? std::string(word_text.get()) : "";
-            w.box = Rect(x1, y1, x2 + 5, y2 + 7); // simple shift for best rendering
+            w.box = Rect(x1-3 , y1-3, x2 + 5, y2 + 7); // simple shift for best rendering
             w.confidence = conf;
             w.block_id = find_block_for_word(w);
 
@@ -189,7 +200,11 @@ private:
         for (const auto& b : blocks_)
             if (cx >= b.box.x1 && cx <= b.box.x2 && cy >= b.box.y1 && cy <= b.box.y2) 
                 return b.id;
-
+            
+            // for(const auto& wd : b.words)
+            //     if (w.text == wd)
+            // if (b.text.find(w.text) != std::string::npos)
+ 
         return -1;
     }
 
@@ -204,3 +219,4 @@ private:
 };
 
 #endif //__TESSERACT_PARSER__
+

@@ -1,11 +1,16 @@
 cmake_minimum_required(VERSION 3.22)
-project(OpenCV_Qt_Tesseract_Test)
+set(PROJECT_NAME LookUpper)
+project(${PROJECT_NAME})
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS 1)
+set(CMAKE_CXX_COMPILER g++)
 
-include(FetchContent)
+set(CMAKE_CXX_FLAGS "")
+set(CMAKE_CXX_FLAGS_DEBUG "")
+set(CMAKE_CXX_FLAGS_RELEASE "")
 
+# include(FetchContent)
 # ---------------- OpenCV ----------------
 find_package(OpenCV REQUIRED)
 if(NOT OpenCV_FOUND)
@@ -22,33 +27,32 @@ endif()
 include_directories(${TESSERACT_INCLUDE_DIRS})
 
 # ---------------- Qt6 ----------------
-find_package(Qt6 6.5 COMPONENTS Widgets Gui Core QUIET)
+find_package(Qt6 COMPONENTS Widgets Gui Core REQUIRED)
+# if(NOT Qt6_FOUND)
+#     message(STATUS "Qt6 not found. Fetching via FetchContent...")
+#     set(FETCHCONTENT_QUIET FALSE)
+#     FetchContent_Declare(
+#         qt
+#         URL https://download.qt.io/official_releases/qt/6.5/6.5.0/single/qt-everywhere-src-6.5.0.tar.xz
+#     )
+#     FetchContent_MakeAvailable(qt)
+#     set(CMAKE_PREFIX_PATH ${qt_SOURCE_DIR})
+#     find_package(Qt6 6.5 COMPONENTS Widgets Gui Core REQUIRED)
+# endif()
 
-if(NOT Qt6_FOUND)
-    message(STATUS "Qt6 not found. Fetching via FetchContent...")
-    set(FETCHCONTENT_QUIET FALSE)
-
-    FetchContent_Declare(
-        qt
-        URL https://download.qt.io/official_releases/qt/6.5/6.5.0/single/qt-everywhere-src-6.5.0.tar.xz
-    )
-    FetchContent_MakeAvailable(qt)
-
-    set(CMAKE_PREFIX_PATH ${qt_SOURCE_DIR})
-    find_package(Qt6 6.5 COMPONENTS Widgets Gui Core REQUIRED)
-endif()
+# Убираем macOS-флаг, если он есть
 
 # ---------------- Executable ----------------
 set(SOURCES
-    main.cc
+    # main.cc
     UI.cc
     Parser.h
 )
 
-add_executable(opencv_test ${SOURCES})
+add_executable(${PROJECT_NAME} ${SOURCES})
 
 # ---------------- Link Libraries ----------------
-target_link_libraries(opencv_test
+target_link_libraries(${PROJECT_NAME}
     PRIVATE
         ${OpenCV_LIBS}
         ${TESSERACT_LIBRARIES}
@@ -57,9 +61,3 @@ target_link_libraries(opencv_test
         Qt6::Core
 )
 
-# ---------------- Enable MOC for Qt ----------------
-set_target_properties(opencv_test PROPERTIES
-    AUTOMOC ON
-    AUTORCC ON
-    AUTOUIC ON
-)

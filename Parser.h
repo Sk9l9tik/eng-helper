@@ -128,7 +128,7 @@ private:
         std::unique_ptr<tesseract::ResultIterator> it(api_->GetIterator());
         if (!it) return;
 
-        tesseract::PageIteratorLevel level = tesseract::RIL_BLOCK; int block_id{};
+        tesseract::PageIteratorLevel level = tesseract::RIL_TEXTLINE; int block_id{};
 
         do {
             auto block_text = make_text(it->GetUTF8Text(level));
@@ -182,7 +182,8 @@ private:
 
             Word w;
             w.text = word_text ? std::string(word_text.get()) : "";
-            w.box = Rect(x1-3 , y1-3, x2 + 5, y2 + 7); // simple shift for best rendering
+            // w.box = Rect(x1-3 , y1-3, x2 + 5, y2 + 7); // simple shift for best rendering
+            w.box = Rect(x1, y1, x2, y2);
             w.confidence = conf;
             w.block_id = find_block_for_word(w);
 

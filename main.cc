@@ -3,7 +3,7 @@
 void make_screenshot(){
     [[deprecated]] const char old_screenshot_command[] = {"grim - | convert - -shave 1x1 PNG:- | wl-copy && wl-paste > screenshot.png"};
 
-    const char screenshot_command[] = {"grim - | magick - -shave 1x1 PNG:- | wl-copy && wl-paste > screenshot.png"};
+    const char screenshot_command[] = {"grim - | magick - -shave 1x1 PNG:- | wl-copy && wl-paste > /home/alex/opencv_test/screenshot.png"};
 
     std::system(screenshot_command);
 }

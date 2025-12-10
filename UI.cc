@@ -11,8 +11,6 @@ void delete_escapes(std::string& str, const std::vector<std::string>& escapes){
 }
 
 std::pair<std::string,std::string> parse_response(
-    // std::unordered_map<std::string, std::pair<std::string, std::string>> &map,
-    // const std::vector<std::string> &word, 
     const std::string &ans) {
     std::string strs = ans;
 
@@ -37,7 +35,6 @@ std::pair<std::string,std::string> parse_response(
 
     delete_escapes(str, {"\\n", "\\\""});
 
-
     auto colon_pos = str.find("#");
 
     return {str.substr(0, colon_pos), str.substr(colon_pos+1, str.size())};
@@ -51,13 +48,7 @@ int draw_interface(QApplication& app, const std::vector<Word>& words, const std:
     QWidget window;
     window.setWindowTitle("Transparent Always-on-Top");
     window.setAttribute(Qt::WA_TranslucentBackground);
-    // window.setWindowFlags(Qt::FramelessWindowHint |
-    // Qt::WindowStaysOnTopHint); window.setStyleSheet("background: rgba(0, 0,
-    // 0, 0);");
 
-    // QVBoxLayout* layout = new QVBoxLayout(&window);
-
-    // widget with translation text
     QWidget *Text = new QWidget(&window);
     Text->setWindowTitle("text");
     Text->setWindowFlags(Qt::ToolTip);
@@ -65,8 +56,6 @@ int draw_interface(QApplication& app, const std::vector<Word>& words, const std:
     QLabel *label = new QLabel(Text);
     label->setWordWrap(true); // включаем перенос строк
     label->setAlignment(Qt::AlignLeft | Qt::AlignTop);
-    // label->setStyleSheet("color: white; background: rgba(0,0,0,180);
-    // padding: 4px;");
 
     QFrame *line = new QFrame(Text);
     line->setFrameShape(QFrame::HLine);
@@ -92,12 +81,6 @@ int draw_interface(QApplication& app, const std::vector<Word>& words, const std:
             }
         }
 
-        // QString word = btn->property("word_text").toString();
-        // QString block = btn->property("block_text").toString();
-        // std::string prompt = word.toStdString() + ":" + block.toStdString();
-        //
-        // std::string sblock = client.sendRequest(prompt);
-
         QObject::connect(
             btn, &QPushButton::clicked,
             [btn, a, Text, &label, 
@@ -116,39 +99,8 @@ int draw_interface(QApplication& app, const std::vector<Word>& words, const std:
 
                std::pair<std::string, std::string> sblock = parse_response(client.sendRequest(prompt));
 
-                // QString word = btn->property("word_text").toString();
-                // QString block = btn->property("block_text").toString();
-                // std::string prompt = word.toStdString() + ":" +
-                // block.toStdString();
-                //
-                // std::string sblock = client.sendRequest(prompt);
-
-                // std::string st = "";
-                // std::vector<std::string> sv;
-                //
-                // std::stringstream ss(sblock);
-                // int cnt{15};
-                // std::string str;
-                // int j = 0;
-                // while(ss >> str){
-                //     sv.emplace_back(str);
-                //     if (str == word.toStdString()){
-                //         for(int i = 1; i < cnt; ++i){
-                //             st += sv[j - i];
-                //         }
-                //         --cnt;
-                //     }
-                //     if (cnt != 0 && cnt != 15){
-                //        st += str;
-                //        --cnt;
-                //     }
-                //     ++j;
-                // }
-
                 Text->setGeometry(a.box.x1, a.box.y1 + 50, 200, 100);
 
-                // std::cout <<
-                // btn->property("block_text").toString().toStdString() << '\n';
 
 
                 // ширина линии = ширина блока - небольшие отступы
@@ -164,17 +116,11 @@ int draw_interface(QApplication& app, const std::vector<Word>& words, const std:
                                 lineY * 2 + 100);
 
 
-                // word
-                //  label->setMaximumWidth(250);
                 label->setWordWrap(true);
-                // label->setText(word);
                 label->setText(QString::fromStdString(sblock.first));
                 label->adjustSize();
 
-                // block
-                //  label2->setMaximumWidth(250);
                 label2->setWordWrap(true);
-                // label2->setText(block);
                 label2->setText(QString::fromStdString(sblock.second));
                 label2->adjustSize();
 

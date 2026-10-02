@@ -28,6 +28,7 @@ cmake_install.cmake
 screenshot*.png
 all_words.txt
 screenshot_highlighted.png
+.todo.md
 
 .vscode/
 

@@ -1,223 +1,363 @@
 #ifndef __TESSERACT_PARSER__
 #define __TESSERACT_PARSER__
 
-#include <iostream>
+#include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <cstdlib>
+#include <fstream>
+#include <future>
+#include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
-#include <fstream>
-#include <string>
 
-#include <opencv2/dnn.hpp>
-#include <opencv2/opencv.hpp>
-#include <tesseract/baseapi.h>
 #include <leptonica/allheaders.h>
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#include <tesseract/baseapi.h>
 #include <tesseract/publictypes.h>
 #include <tesseract/resultiterator.h>
 
-// TODO: wrap this code into namespace 
+#include "Text.h"
 
-struct Rect {
-    int x1, y1, x2, y2;
-
-    Rect(int x1, int y1, int x2, int y2) : x1(x1), y1(y1), x2(x2), y2(y2) {}
-    Rect() : x1(0), y1(0), x2(0), y2(0) {}
-};
-
-struct Block {
-   int id;
-   std::vector<std::string> words;
-   std::string text;
-   Rect box;
-
-   Block(int id_, std::string text_, Rect box_) : id(id_), words{text_}, text{text_}, box(box_) {};
-   Block() : id(0), text(), box({}), words{} {};
-};
-
-struct Word{
-    std::string text;
-    Rect box;
-    int block_id;
-    float confidence;
-
-   // Word(int id_, std::string text_, Rect box_) : id(id_), text(text_), box(box_) {};
-   // Word() : id(0), text(""), box({}) {};
-};
+// TODO: wrap this code into namespace
 
 class Parser {
 public:
-    explicit Parser(const cv::Mat& image, const std::string& tesseract_data_path = "", const std::string& lang = "eng")
-        : img_original_(image), api_(nullptr, [](tesseract::TessBaseAPI* p){ if (p) { p->End(); delete p;} }) {
-            if (img_original_.empty())
-                throw std::runtime_error("Empty image passed to Parser");
-            
-            tesseract::TessBaseAPI* raw = new tesseract::TessBaseAPI();
-            if (raw->Init(tesseract_data_path.empty() ? NULL : tesseract_data_path.c_str(), lang.c_str())){
-                delete raw;
-                throw std::runtime_error("Failed to initialize tesseract API");
-            }
-            api_.reset(raw);
+  // Loading a model takes ~150 ms, so all instances are loaded in parallel.
+  // Parser is created before the screenshot is taken (see main), so loading
+  // overlaps with the capture.
+  explicit Parser(const std::string& tesseract_data_path = "",
+                  const std::string& lang = "eng") {
+    std::vector<std::future<TesseractApi>> apis;
+    for (int i = 0; i < worker_count(); ++i)
+      apis.push_back(
+          std::async(std::launch::async, make_api, tesseract_data_path, lang));
+    for (auto& a : apis)
+      apis_.push_back(a.get());
+  }
 
-            if (img_original_.channels() == 4) {
-                cv::cvtColor(img_original_, img_rgb_, cv::COLOR_BGRA2RGB);
-            }
-            else if (img_original_.channels() == 3) {
-                cv::cvtColor(img_original_, img_rgb_, cv::COLOR_BGR2RGB);
-            }
-            else if (img_original_.channels() == 1) {
-                cv::cvtColor(img_original_, img_rgb_, cv::COLOR_GRAY2RGB);
-            }
-            else {
-                throw std::runtime_error("Unsupported number of channels in image");
-            }
+  const std::vector<Block>& get_blocks() const { return blocks_; }
+  const std::vector<Word>& get_words() const { return words_; }
+
+  void save_detected_words(const std::string& filename) const {
+    ::save_detected_words(filename, blocks_, words_);
+  }
+
+  // The image is split into horizontal strips recognized in parallel, one per
+  // instance: tesseract barely scales with OpenMP threads. Almost all the time
+  // is LSTM recognition, proportional to the amount of text; more strips than
+  // instances (for balance) and other page segmentation modes were no faster.
+  void process(const cv::Mat& image) {
+    if (image.empty())
+      throw std::runtime_error("Empty image passed to Parser");
+
+    cv::Mat gray;
+    if (image.channels() == 4)
+      cv::cvtColor(image, gray, cv::COLOR_BGRA2GRAY);
+    else if (image.channels() == 3)
+      cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+    else if (image.channels() == 1)
+      gray = image;
+    else
+      throw std::runtime_error("Unsupported number of channels in image");
+    img_size_ = gray.size();
+
+    const cv::Mat norm = dark_text_on_light(gray);
+    const std::vector<int> cuts =
+        strip_cuts(norm, static_cast<int>(apis_.size()));
+    // A cut can still go through a line (a video frame has no empty rows), so
+    // strips overlap by `overlap` rows and each keeps only words centered in
+    // its own rows: every line up to 2 * `overlap` high is seen whole once.
+    // More overlap costs time: at 100 recognition was ~50% slower.
+    constexpr int overlap = 40;
+    std::vector<Strip> strips;
+    for (size_t k = 0; k + 1 < cuts.size(); ++k) {
+      const int y0 = std::max(0, cuts[k] - overlap),
+                y1 = std::min(norm.rows, cuts[k + 1] + overlap);
+      strips.push_back({norm(cv::Range(y0, y1), cv::Range::all()),
+                        y0,
+                        cuts[k],
+                        cuts[k + 1],
+                        {},
+                        {}});
+    }
+
+    std::atomic<size_t> next{0};
+    std::vector<std::future<void>> jobs;
+    for (auto& api : apis_)
+      jobs.push_back(std::async(std::launch::async, [&, api = api.get()] {
+        for (size_t k; (k = next++) < strips.size();) {
+          recognize(*api, strips[k].img);
+          extract_blocks(*api, strips[k]);
+          extract_words_and_map_to_blocks(*api, strips[k]);
         }
+      }));
+    for (auto& j : jobs)
+      j.get();
 
-    const std::vector<Block>& get_blocks() const { return blocks_; }
-    const std::vector<Word>& get_words() const { return words_; }
-
-    // start pipeline
-    void process(){
-        set_image_to_api();
-        recognize();
-        extract_blocks();
-        extract_words_and_map_to_blocks();
+    // strips have their own block and paragraph ids; paragraphs of different
+    // strips never merge
+    blocks_.clear();
+    words_.clear();
+    int para_offset = 0;
+    for (auto& st : strips) {
+      const int block_offset = static_cast<int>(blocks_.size());
+      int para_count = 0;
+      for (auto& b : st.blocks) {
+        b.id += block_offset;
+        blocks_.push_back(std::move(b));
+      }
+      for (auto& w : st.words) {
+        if (w.block_id >= 0)
+          w.block_id += block_offset;
+        para_count = std::max(para_count, w.para_id + 1);
+        w.para_id += para_offset;
+        words_.push_back(std::move(w));
+      }
+      para_offset += para_count;
     }
-
-
-    void save_detected_words(const std::string& filename) const {
-        std::ofstream ofs(filename);
-        if(!ofs) throw std::runtime_error("Cannot open output file");
-
-
-        ofs << "Blocks:\n";
-        for (const auto& b : blocks_) {
-            ofs << b.id << ": (" << b.box.x1 << "," << b.box.y1 << ") - (" << b.box.x2 << "," << b.box.y2 << ")\n";
-            ofs << [&b](){std::string s; for(auto& it : b.text) s+= it; return s;}() << "\n---\n";
-            // ofs << b.text << "\n---\n";
-        }
-
-
-        ofs << "\nWords:\n";
-        for (const auto& w : words_) {
-            ofs << "block_id=" << w.block_id << " conf=" << w.confidence << " text=\"" << w.text << "\"\n";
-            ofs << w.box.x1 << " " << w.box.y1 << "\n";
-            ofs << w.box.x2 << " " << w.box.y2 << "\n\n";
-        }
-    }
-private:
-    void set_image_to_api(){
-        api_->SetImage(img_rgb_.data, img_rgb_.cols, img_rgb_.rows, img_rgb_.channels(), static_cast<int>(img_rgb_.step));
-    }
-
-    void recognize(){
-        api_->SetPageSegMode(tesseract::PSM_AUTO);
-        if(api_->Recognize(0) != 0)
-            throw std::runtime_error("Tesseract recognize failed");
-    }
-
-
-    using TesseractString = std::unique_ptr<char, void(*)(void*)>;
-    TesseractString make_text(char* p) {
-        return TesseractString(p, [](void* mem){ delete[] static_cast<char*>(mem); });
-    }
-
-    void extract_blocks(){
-        blocks_.clear();
-        std::unique_ptr<tesseract::ResultIterator> it(api_->GetIterator());
-        if (!it) return;
-
-        tesseract::PageIteratorLevel level = tesseract::RIL_TEXTLINE; int block_id{};
-
-        do {
-            auto block_text = make_text(it->GetUTF8Text(level));
-
-            if (block_text){
-                int x1, y1, x2, y2;
-                if (it->BoundingBox(level, &x1, &y1, &x2, &y2)) {
-                    Block b;
-                    b.id = block_id++;
-                    b.box = Rect(x1, y1, x2, y2);
-                    b.text = block_text ? std::string(block_text.get()) : "";
-                    b.words = [&b](){
-                        std::vector<std::string> v;
-                        std::string s = b.text;
-                        std::istringstream ss(s);
-                        std::string tmp;
-                        while(ss >> tmp){
-                            v.emplace_back(tmp);
-                        }
-                        return v;
-                    }();
-                    blocks_.emplace_back(b);
-                }
-            }
-
-        } while (it->Next(level));
-    }
-
-
-    void extract_words_and_map_to_blocks() {
-        words_.clear();
-
-        std::unique_ptr<tesseract::ResultIterator> it(api_->GetIterator());
-        if (!it) return;
-
-        tesseract::PageIteratorLevel level = tesseract::RIL_WORD;
-
-        do {
-            auto word_text = make_text(it->GetUTF8Text(level));
-
-            float conf = it->Confidence(level);
-
-            int x1, y1, x2, y2;
-            bool has_box = it->BoundingBox(level, &x1, &y1, &x2, &y2);
-
-            // READ: This check is real need?
-            if (!has_box) {
-                if (word_text) word_text.get_deleter();
-                continue;
-            }
-
-            Word w;
-            w.text = word_text ? std::string(word_text.get()) : "";
-            // w.box = Rect(x1-3 , y1-3, x2 + 5, y2 + 7); // simple shift for best rendering
-            w.box = Rect(x1, y1, x2, y2);
-            w.confidence = conf;
-            w.block_id = find_block_for_word(w);
-
-            words_.emplace_back(std::move(w));
-
-            if (word_text) word_text.get_deleter();
-        }
-        while (it->Next(level));
-    }
-
-    int find_block_for_word(const Word& w){
-        double cx = (w.box.x1 + w.box.x2) / 2.0;
-        double cy = (w.box.y1 + w.box.y2) / 2.0;
-
-        for (const auto& b : blocks_)
-            if (cx >= b.box.x1 && cx <= b.box.x2 && cy >= b.box.y1 && cy <= b.box.y2) 
-                return b.id;
-            
-            // for(const auto& wd : b.words)
-            //     if (w.text == wd)
-            // if (b.text.find(w.text) != std::string::npos)
- 
-        return -1;
-    }
+    fix_misread_i(words_);
+    build_contexts(words_);
+  }
 
 private:
-    cv::Mat img_original_;  // BGR
-    cv::Mat img_rgb_;       //RGB
+  using TesseractApi = std::unique_ptr<tesseract::TessBaseAPI,
+                                       void (*)(tesseract::TessBaseAPI*)>;
 
-    std::unique_ptr<tesseract::TessBaseAPI, void(*)(tesseract::TessBaseAPI*)> api_;
+  static TesseractApi make_api(const std::string& tesseract_data_path,
+                               const std::string& lang) {
+    TesseractApi api(new tesseract::TessBaseAPI(),
+                     [](tesseract::TessBaseAPI* p) {
+                       if (p) {
+                         p->End();
+                         delete p;
+                       }
+                     });
+    if (api->Init(tesseract_data_path.empty() ? NULL
+                                              : tesseract_data_path.c_str(),
+                  lang.c_str()))
+      throw std::runtime_error("Failed to initialize tesseract API");
+    // text is always given dark on light (see dark_text_on_light), so
+    // tesseract's own inverted-text pass is not needed
+    api->SetVariable("tessedit_do_invert", "0");
+    return api;
+  }
 
-    std::vector<Block> blocks_;
-    std::vector<Word> words_;
+  struct Strip {
+    cv::Mat img;        // view into the normalized image
+    int y0;             // strip offset in the full image
+    int own_y1, own_y2; // rows of the full image this strip is responsible for,
+                        // the rest is overlap
+    std::vector<Block> blocks; // ids from 0 within the strip
+    std::vector<Word> words;   // block and paragraph ids within the strip
+
+    // y1, y2 are within the strip image
+    bool owns(int y1, int y2) const {
+      const int cy = y0 + (y1 + y2) / 2;
+      return cy >= own_y1 && cy < own_y2;
+    }
+  };
+
+  // one tesseract instance per core
+  static int worker_count() {
+    return std::max(1u, std::thread::hardware_concurrency());
+  }
+
+  // Screens mix dark text on light (a white banner, a link preview) and light
+  // text on dark (a dark chat). Text is a minority of pixels around it, so a
+  // large median gives the local background, and the distance to it gives text
+  // of either polarity as dark on light. The median runs on a downscaled copy:
+  // full size is slow.
+  static cv::Mat dark_text_on_light(const cv::Mat& gray) {
+    constexpr int scale = 4;
+    constexpr int kernel = 25; // ~100 px in the full image: wider than a glyph,
+                               // narrower than a panel
+    cv::Mat small, bg;
+    cv::resize(gray, small, cv::Size(), 1.0 / scale, 1.0 / scale,
+               cv::INTER_AREA);
+    cv::medianBlur(small, small, kernel);
+    cv::resize(small, bg, gray.size(), 0, 0, cv::INTER_LINEAR);
+    cv::Mat diff, out;
+    cv::absdiff(gray, bg, diff);
+    cv::subtract(cv::Scalar(255), diff, out);
+    return out;
+  }
+
+  // Rows where the image is cut into n strips. A cut is placed on the most
+  // uniform row near the even split, so it goes between text lines rather than
+  // through them.
+  static std::vector<int> strip_cuts(const cv::Mat& gray, int n) {
+    std::vector<int> cuts{0};
+    const int window = gray.rows / (4 * n);
+    for (int k = 1; k < n; ++k) {
+      const int target = gray.rows * k / n;
+      int best = target;
+      double best_dev = std::numeric_limits<double>::max();
+      for (int y = std::max(cuts.back() + 1, target - window);
+           y <= std::min(gray.rows - 1, target + window); ++y) {
+        cv::Scalar mean, dev;
+        cv::meanStdDev(gray.row(y), mean, dev);
+        // ties go to the row closest to the even split
+        if (dev[0] < best_dev ||
+            (dev[0] == best_dev &&
+             std::abs(y - target) < std::abs(best - target))) {
+          best_dev = dev[0];
+          best = y;
+        }
+      }
+      cuts.push_back(best);
+    }
+    cuts.push_back(gray.rows);
+    return cuts;
+  }
+
+  static void recognize(tesseract::TessBaseAPI& api, const cv::Mat& img) {
+    api.SetImage(img.data, img.cols, img.rows, img.channels(),
+                 static_cast<int>(img.step));
+    api.SetPageSegMode(tesseract::PSM_AUTO);
+    if (api.Recognize(0) != 0)
+      throw std::runtime_error("Tesseract recognize failed");
+  }
+
+  using TesseractString = std::unique_ptr<char, void (*)(void*)>;
+  static TesseractString make_text(char* p) {
+    return TesseractString(p,
+                           [](void* mem) { delete[] static_cast<char*>(mem); });
+  }
+
+  static void extract_blocks(tesseract::TessBaseAPI& api, Strip& strip) {
+    std::unique_ptr<tesseract::ResultIterator> it(api.GetIterator());
+    if (!it)
+      return;
+
+    tesseract::PageIteratorLevel level = tesseract::RIL_TEXTLINE;
+    int block_id = 0;
+
+    do {
+      auto block_text = make_text(it->GetUTF8Text(level));
+
+      if (block_text) {
+        int x1, y1, x2, y2;
+        if (it->BoundingBox(level, &x1, &y1, &x2, &y2) && strip.owns(y1, y2)) {
+          Block b;
+          b.id = block_id++;
+          b.box = Rect(x1, y1 + strip.y0, x2, y2 + strip.y0);
+          b.text = block_text ? std::string(block_text.get()) : "";
+          b.words = [&b]() {
+            std::vector<std::string> v;
+            std::string s = b.text;
+            std::istringstream ss(s);
+            std::string tmp;
+            while (ss >> tmp) {
+              v.emplace_back(tmp);
+            }
+            return v;
+          }();
+          strip.blocks.emplace_back(b);
+        }
+      }
+
+    } while (it->Next(level));
+  }
+
+  void extract_words_and_map_to_blocks(tesseract::TessBaseAPI& api,
+                                       Strip& strip) const {
+    std::unique_ptr<tesseract::ResultIterator> it(api.GetIterator());
+    if (!it)
+      return;
+
+    tesseract::PageIteratorLevel level = tesseract::RIL_WORD;
+    int para_id = -1;
+
+    do {
+      if (it->IsAtBeginningOf(tesseract::RIL_PARA))
+        ++para_id;
+
+      auto word_text = make_text(it->GetUTF8Text(level));
+
+      float conf = it->Confidence(level);
+
+      int x1, y1, x2, y2;
+      bool has_box = it->BoundingBox(level, &x1, &y1, &x2, &y2);
+
+      // READ: This check is real need?
+      if (!has_box) {
+        if (word_text)
+          word_text.get_deleter();
+        continue;
+      }
+
+      // low confidence words are mostly icons, borders and other noise
+      if (!word_text || conf < 50.0f)
+        continue;
+
+      // tesseract sometimes returns whitespace or lines as "words" with huge
+      // boxes over images and panels
+      std::string_view text_view(word_text.get());
+      // "|" is kept for now: it may be a misread "I" (see fix_misread_i)
+      if (text_view != "|" &&
+          std::none_of(text_view.begin(), text_view.end(), [](unsigned char c) {
+            return std::isalnum(c) || c >= 0x80;
+          }))
+        continue;
+      if (y2 - y1 > img_size_.height / 4 || x2 - x1 > img_size_.width / 2)
+        continue;
+      // in the overlap: the neighbour strip has it
+      if (!strip.owns(y1, y2))
+        continue;
+
+      Word w;
+      w.text = word_text ? std::string(word_text.get()) : "";
+      // w.box = Rect(x1-3 , y1-3, x2 + 5, y2 + 7); // simple shift for best
+      // rendering
+      w.box = Rect(x1, y1 + strip.y0, x2, y2 + strip.y0);
+      w.confidence = conf;
+      w.block_id = find_block_for_word(w, strip.blocks);
+      w.para_id = para_id;
+      if (it->BoundingBox(tesseract::RIL_TEXTLINE, &w.line.x1, &w.line.y1,
+                          &w.line.x2, &w.line.y2)) {
+        w.line.y1 += strip.y0;
+        w.line.y2 += strip.y0;
+      } else
+        w.line = w.box;
+
+      strip.words.emplace_back(std::move(w));
+
+      if (word_text)
+        word_text.get_deleter();
+    } while (it->Next(level));
+  }
+
+  static int find_block_for_word(const Word& w,
+                                 const std::vector<Block>& blocks) {
+    double cx = (w.box.x1 + w.box.x2) / 2.0;
+    double cy = (w.box.y1 + w.box.y2) / 2.0;
+
+    for (const auto& b : blocks)
+      if (cx >= b.box.x1 && cx <= b.box.x2 && cy >= b.box.y1 && cy <= b.box.y2)
+        return b.id;
+
+    // for(const auto& wd : b.words)
+    //     if (w.text == wd)
+    // if (b.text.find(w.text) != std::string::npos)
+
+    return -1;
+  }
+
+private:
+  std::vector<TesseractApi> apis_;
+  cv::Size img_size_; // of the last processed image
+
+  std::vector<Block> blocks_;
+  std::vector<Word> words_;
 };
 
 #endif //__TESSERACT_PARSER__
-

@@ -1,0 +1,39 @@
+# LookUpper — what a new machine needs. Package names are for Arch Linux.
+# The app is C++; the Python script needs only the standard library, so there is nothing to pip install.
+
+# ---- Build ----
+# pacman -S --needed gcc cmake pkgconf
+gcc
+cmake            # >= 3.22
+pkgconf
+
+# ---- Libraries ----
+# pacman -S --needed opencv vtk hdf5 tesseract leptonica qt6-base layer-shell-qt zlib curl
+opencv           # core, imgproc, imgcodecs; its CMake config also wants vtk and hdf5 installed
+vtk
+hdf5
+tesseract        # the English model (tessdata_fast) is downloaded by CMake at configure time
+leptonica
+qt6-base         # Widgets, Gui, Core, Network
+layer-shell-qt   # overlay window on Wayland
+zlib             # dictionary index
+curl             # ollama, AnkiConnect, pronunciations
+
+# ---- Runtime ----
+# pacman -S --needed grim python ollama
+grim             # screenshot; needs a wlroots compositor (Hyprland, sway, ...)
+python           # >= 3.12, for tools/fetch_dictionaries.py
+ollama           # translation in context: systemctl enable --now ollama && ollama pull gemma3:1b
+
+# ---- Anki ----
+# yay -S anki (or anki-bin)
+anki
+# AnkiConnect add-on: Tools -> Add-ons -> Get Add-ons -> code 2055492159 (Anki must be running when adding cards)
+# Lapis note type: https://github.com/donkuri/lapis, deck "Mining" (see AnkiClient in Anki.h)
+
+# ---- Data ----
+# python3 tools/fetch_dictionaries.py               # FreeDict eng-rus + pronunciation index -> ~/.local/share/lookupper
+# python3 tools/fetch_dictionaries.py --all-audio   # optional: download every pronunciation now instead of on demand
+
+# ---- Build and run ----
+# cmake -B build && cmake --build build -j && ./build/LookUpper

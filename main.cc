@@ -4,6 +4,7 @@
 
 #include <future>
 #include <memory>
+#include <optional>
 #include <string_view>
 
 #include "UI.h"
@@ -21,6 +22,63 @@ cv::Mat make_screenshot() {
     buf.insert(buf.end(), chunk, chunk + n);
 
   return cv::imdecode(buf, cv::IMREAD_COLOR);
+}
+
+// Cursor position on the screen, from Hyprland
+std::optional<cv::Point> cursor_pos() {
+  std::unique_ptr<FILE, int (*)(FILE*)> pipe(
+      popen("hyprctl cursorpos 2>/dev/null", "r"), pclose);
+  int x, y;
+  if (!pipe || fscanf(pipe.get(), "%d, %d", &x, &y) != 2)
+    return std::nullopt;
+  return cv::Point(x, y);
+}
+
+// Only the text around the cursor is recognized: recognition time grows with
+// the amount of text, and a full screen of it takes several times longer. The
+// whole screenshot is still taken (it is cheap) for the Anki picture.
+// Assumes scale 1: hyprctl gives logical coordinates, grim physical pixels.
+constexpr int kOcrSize = 700;
+
+cv::Rect ocr_area(const cv::Mat& screen, std::optional<cv::Point> cursor) {
+  const cv::Rect all(0, 0, screen.cols, screen.rows);
+  if (!cursor)
+    return all;
+  cv::Rect area(cursor->x - kOcrSize / 2, cursor->y - kOcrSize / 2, kOcrSize,
+                kOcrSize);
+  // near an edge the square moves inside rather than shrinks
+  area.x = std::clamp(area.x, 0, std::max(0, screen.cols - kOcrSize));
+  area.y = std::clamp(area.y, 0, std::max(0, screen.rows - kOcrSize));
+  area &= all;
+
+  // Text lines the square cuts are taken whole, so words are not cut in half
+  // and the sentence around the clicked word is all there. Letters and words
+  // of a line are merged into one blob; tall blobs are pictures, not lines.
+  cv::Mat gray, text;
+  cv::cvtColor(screen, gray, cv::COLOR_BGR2GRAY);
+  cv::threshold(Parser::dark_text_on_light(gray), text, 255 - 40, 255,
+                cv::THRESH_BINARY_INV);
+  cv::dilate(text, text,
+             cv::getStructuringElement(cv::MORPH_RECT, cv::Size(25, 3)));
+  cv::Mat labels, stats, centroids;
+  const int n = cv::connectedComponentsWithStats(text, labels, stats, centroids);
+  constexpr int max_line_height = 100;
+  cv::Rect out = area;
+  for (int i = 1; i < n; ++i) {
+    const cv::Rect blob(stats.at<int>(i, cv::CC_STAT_LEFT),
+                        stats.at<int>(i, cv::CC_STAT_TOP),
+                        stats.at<int>(i, cv::CC_STAT_WIDTH),
+                        stats.at<int>(i, cv::CC_STAT_HEIGHT));
+    if (blob.height <= max_line_height && (blob & area).area() > 0)
+      out |= blob;
+  }
+  // a little room around the letters
+  constexpr int pad = 4;
+  out.x -= pad;
+  out.y -= pad;
+  out.width += 2 * pad;
+  out.height += 2 * pad;
+  return out & all;
 }
 
 int main(int argc, char** argv) {
@@ -44,10 +102,13 @@ int main(int argc, char** argv) {
 
   cv::Mat img = make_screenshot();
 
+  const auto cursor = cursor_pos();
+  cv::Rect area;
   auto recognized = std::async(std::launch::async, [&] {
     auto p = parser.get();
-    p->process(img);
-    p->save_detected_words("all_words.txt");
+    area = ocr_area(img, cursor);
+    p->process(img(area), area.tl());
+    p->save_detected_words("/tmp/all_words.txt");
     return p;
   });
 
@@ -57,7 +118,7 @@ int main(int argc, char** argv) {
   QApplication::setStyle("Fusion");
 
   auto p = recognized.get();
-  draw_interface(app, img, p->get_words(), p->get_blocks());
+  draw_interface(app, img, *p, area, cursor);
 
   return 0;
 }

@@ -23,7 +23,7 @@ curl             # ollama, AnkiConnect, pronunciations
 # pacman -S --needed grim python ollama
 grim             # screenshot; needs a wlroots compositor (Hyprland, sway, ...)
 python           # >= 3.12, for tools/fetch_dictionaries.py
-ollama           # translation in context: systemctl enable --now ollama && ollama pull gemma3:1b
+ollama           # translation in context: systemctl enable --now ollama && ollama pull translategemma:4b # or less model gemma3:1b
 
 # ---- Anki ----
 # yay -S anki (or anki-bin)

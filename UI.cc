@@ -1,5 +1,9 @@
 #include "UI.h"
 
+#include <QRegularExpression>
+
+#include <numeric>
+
 
 namespace {
 
@@ -52,6 +56,8 @@ QWidget* make_caption(const QString& text, QWidget* parent) {
 class Popup : public QFrame {
 public:
   std::function<void()> on_add_to_anki;
+  std::function<void()> on_retranslate;
+  std::function<void()> on_improve_ocr;
 
   explicit Popup(QWidget* parent) : QFrame(parent) {
     setObjectName("popup");
@@ -99,15 +105,41 @@ public:
     layout->addSpacing(4);
     layout->addWidget(make_caption("Context", this));
 
+    // the recognized sentence with a button to recognize the area again, right
+    // above the one to translate the sentence again
+    auto* context_row = new QHBoxLayout();
+    context_row->setSpacing(8);
     context_ = new QLabel(this);
     context_->setWordWrap(true);
     context_->setTextFormat(Qt::RichText);
-    layout->addWidget(context_);
+    context_row->addWidget(context_, 1);
+    improve_ = new QPushButton(this);
+    improve_->setObjectName("anki");
+    improve_->setCursor(Qt::PointingHandCursor);
+    connect(improve_, &QPushButton::clicked, this, [this] {
+      if (on_improve_ocr)
+        on_improve_ocr();
+    });
+    context_row->addWidget(improve_, 0, Qt::AlignTop);
+    layout->addLayout(context_row);
 
+    // the sentence translation with a button to translate it again
+    auto* translation_row = new QHBoxLayout();
+    translation_row->setSpacing(8);
     translation_ = new QLabel(this);
     translation_->setObjectName("translation");
     translation_->setWordWrap(true);
-    layout->addWidget(translation_);
+    translation_row->addWidget(translation_, 1);
+    retranslate_ = new QPushButton("↻", this);
+    retranslate_->setObjectName("anki");
+    retranslate_->setCursor(Qt::PointingHandCursor);
+    retranslate_->setToolTip("Translate the sentence again");
+    connect(retranslate_, &QPushButton::clicked, this, [this] {
+      if (on_retranslate)
+        on_retranslate();
+    });
+    translation_row->addWidget(retranslate_, 0, Qt::AlignTop);
+    layout->addLayout(translation_row);
 
     hide();
   }
@@ -122,10 +154,14 @@ public:
     word_text_ = clean;
     context_text_ = QString::fromStdString(context).simplified().toStdString();
     entry_ = entry;
+    options_ = dict_options(entry);
     word_ru_.clear();
     sentence_ru_.clear();
+    sentence_only_ = false;
+    set_improve_state("OCR", true, "Recognize the area again");
     // the card is added with the translation in context, so wait for it
     set_anki_state(shown_, "Translating…", false);
+    retranslate_->setEnabled(false);
 
     word_->setText(QString::fromStdString(entry ? entry->headword : clean));
     ipa_->setText(entry ? QString::fromStdString(entry->ipa) : "");
@@ -157,43 +193,58 @@ public:
     raise();
   }
 
-  // The model answers with two lines: the word as used in the sentence, then
-  // the whole sentence
+  // The local model streams the sentence translation as text with the word in
+  // **…** (see marked_md)
   void append_translation(const std::string& piece) {
     translated_ += QString::fromStdString(piece);
-    const QString text = translated_.trimmed();
-    const int nl = text.indexOf('\n');
-    const QString first = (nl < 0 ? text : text.left(nl)).trimmed();
-
-    if (nl < 0 && first.count(' ') >= 3) {
-      // too long for a word: the model skipped the first line and is
-      // translating the sentence
-      set_in_context("");
-      translation_->setText(first);
-      word_ru_.clear();
-      sentence_ru_ = first.toStdString();
-    } else {
-      set_in_context(first);
-      translation_->setText(nl < 0 ? "…" : text.mid(nl + 1).trimmed());
-      word_ru_ = first.toStdString();
-      sentence_ru_ = nl < 0 ? "" : text.mid(nl + 1).trimmed().toStdString();
-    }
-    adjustSize();
-    place();
+    show_marked(bold_md_to_html(translated_, false), false);
   }
 
-  // Sentence translation from a separate request, when the model gave only the
-  // word
+  void show_marked_final() {
+    show_marked(bold_md_to_html(translated_, true), true);
+  }
+
+  // Translation of the word alone, for when the sentence translation does
+  // not show which words are its: ignored if a dictionary translation was
+  // found there
+  void set_word_translation(const QString& word) {
+    if (!word_ru_.empty() || word.isEmpty())
+      return;
+    show_result(sentence_shown_, find_any(sentence_shown_, {word}), word, true);
+  }
+
+  // Another translation of the sentence ("↻"): the word is already known,
+  // only marked in the new sentence
   void append_sentence(const std::string& piece) {
     sentence_ += QString::fromStdString(piece);
-    const QString text = sentence_.trimmed();
-    translation_->setText(text.isEmpty() ? "…" : text);
-    sentence_ru_ = text.toStdString();
-    adjustSize();
-    place();
+    auto [sentence, span] = parse_marked(bold_md_to_html(sentence_, false), false);
+    if (!span.len)
+      span = find_any(sentence, options_);
+    if (!span.len)
+      span = find_any(sentence, {fixed_word_});
+    show_result(sentence, span, fixed_word_, true);
   }
 
-  void finish_translation() { set_anki_state(shown_, "+ Anki", true); }
+  // a new translation of the same word is coming
+  // Another translation of the sentence is coming; the word in context stays
+  void restart_sentence() {
+    sentence_only_ = true;
+    fixed_word_ = QString::fromStdString(word_ru_);
+    sentence_.clear();
+    translation_->setText("…");
+    set_anki_state(shown_, "Translating…", false);
+    retranslate_->setEnabled(false);
+  }
+
+  // a translation of the word is found in the sentence
+  bool word_found() const { return !word_ru_.empty(); }
+
+  void finish_translation() {
+    retranslate_->setEnabled(true);
+    if (word_ru_.empty())
+      set_in_context("");
+    set_anki_state(shown_, "+ Anki", true);
+  }
 
   // `shown` is what shown() returned when the request started: a newer word
   // ignores stale results
@@ -204,6 +255,13 @@ public:
     anki_->setText(text);
     anki_->setEnabled(enabled);
     anki_->setToolTip(tooltip);
+  }
+
+  void set_improve_state(const QString& text, bool enabled,
+                         const QString& tooltip) {
+    improve_->setText(text);
+    improve_->setEnabled(enabled);
+    improve_->setToolTip(tooltip);
   }
 
   int shown() const { return shown_; }
@@ -217,7 +275,8 @@ public:
 
   void set_translation_error(const QString& error) {
     finish_translation();
-    set_in_context("");
+    if (!sentence_only_)
+      set_in_context("");
     translation_->setText("<span style='color:#d08770'>" +
                           error.toHtmlEscaped() + "</span>");
     adjustSize();
@@ -293,6 +352,225 @@ private:
            text.mid(at + w.size()).toHtmlEscaped();
   }
 
+  struct Span {
+    int at = 0, len = 0;
+  };
+
+public:
+  // Translation of the sentence with the clicked word in <b>: the tag is
+  // carried over to the word's translation by Yandex, and by the local model
+  // as **…** (bold_md_to_html). Without it the word is found by its
+  // dictionary translations.
+  void show_marked(const QString& html, bool done = true) {
+    auto [sentence, span] = parse_marked(html, done);
+    const QString marked = sentence.mid(span.at, span.len);
+
+    // the dictionary form if the marked word is one of the dictionary words
+    QString word = marked;
+    for (const auto& option : options_)
+      if (find_phrase(word, option, true).len) {
+        word = option;
+        break;
+      }
+    if (!span.len) {
+      word.clear();
+      span = find_any(sentence, options_, &word);
+      // "цветок" found as "цветущих": the word as it is in the sentence,
+      // not a dictionary word of another part of speech
+      const QString hit = sentence.mid(span.at, span.len);
+      if (span.len && !find_phrase(hit, word, true).len)
+        word = hit;
+    }
+    show_result(sentence, span, word, done);
+  }
+
+  // The local model marks the word with **…** (markdown) much more often than
+  // with <b>: text -> escaped HTML with <b>. While streaming, a lone "*" at the
+  // end may be the first half of "**" and is not shown.
+  static QString bold_md_to_html(const QString& text, bool done) {
+    QString t = text;
+    if (!done && t.endsWith('*') && !t.endsWith("**"))
+      t.chop(1);
+    const QStringList parts = t.toHtmlEscaped().split("**");
+    QString out = parts.front();
+    for (int i = 1; i < parts.size(); ++i)
+      out += (i % 2 ? "<b>" : "</b>") + parts[i];
+    return out;
+  }
+
+private:
+  // Sentence without tags and the text of its first <b>.
+  // `done`: no more text is coming; while streaming, an unclosed <b> marks
+  // up to the end, and a tag still being written is not shown.
+  static std::pair<QString, Span> parse_marked(QString html, bool done) {
+    if (!done)
+      if (const int lt = html.lastIndexOf('<'); lt > html.lastIndexOf('>'))
+        html.truncate(lt);
+    static const QRegularExpression tag("<(/?)([a-zA-Z]*)[^>]*>");
+    QString sentence;
+    Span span;
+    bool open = false; // inside the first <b>
+    int from = 0;
+    auto text = [](QString t) {
+      return t.replace("&lt;", "<")
+          .replace("&gt;", ">")
+          .replace("&quot;", "\"")
+          .replace("&#39;", "'")
+          .replace("&nbsp;", " ")
+          .replace("&amp;", "&");
+    };
+    for (auto it = tag.globalMatch(html); it.hasNext();) {
+      const auto m = it.next();
+      sentence += text(html.mid(from, m.capturedStart() - from));
+      from = m.capturedEnd();
+      if (m.captured(2).toLower() != "b")
+        continue;
+      if (m.captured(1).isEmpty() && !span.len && !open) {
+        span.at = sentence.size();
+        open = true;
+      } else if (!m.captured(1).isEmpty() && open) {
+        span.len = sentence.size() - span.at;
+        open = false;
+      }
+    }
+    sentence += text(html.mid(from));
+    if (open) // still streaming the word
+      span.len = sentence.size() - span.at;
+    // whitespace at the tag edges ("<b> передам </b>") and around the sentence
+    span.at = std::min<int>(span.at, sentence.size());
+    span.len = std::min<int>(span.len, sentence.size() - span.at);
+    while (span.len && sentence[span.at].isSpace()) {
+      ++span.at;
+      --span.len;
+    }
+    while (span.len && sentence[span.at + span.len - 1].isSpace())
+      --span.len;
+    int lead = 0;
+    while (lead < sentence.size() && sentence[lead].isSpace())
+      ++lead;
+    sentence = sentence.mid(lead);
+    while (!sentence.isEmpty() && sentence.back().isSpace())
+      sentence.chop(1);
+    span.at = std::max(0, span.at - lead);
+    return {sentence, span};
+  }
+
+  void show_result(const QString& sentence, Span span, const QString& word,
+                   bool done) {
+    sentence_shown_ = sentence;
+    set_in_context(word.isEmpty() && !done ? "…" : word);
+    const QString before = sentence.left(span.at),
+                  marked = sentence.mid(span.at, span.len),
+                  after = sentence.mid(span.at + span.len);
+    translation_->setText(
+        sentence.isEmpty()
+            ? "…"
+            : before.toHtmlEscaped() +
+                  (span.len ? "<i style='color:#e5c100'>" +
+                                  marked.toHtmlEscaped() + "</i>"
+                            : "") +
+                  after.toHtmlEscaped());
+    word_ru_ = word.toStdString();
+    // the Anki card shows "[...]" in bold
+    sentence_ru_ = (span.len ? before + "[" + marked + "]" + after : sentence)
+                       .toStdString();
+    adjustSize();
+    place();
+  }
+
+  // Same word in another form: "сообщать" ~ "сообщу", "искусство" ~
+  // "искусства". Short words must match exactly
+  // `strict`: only the ending differs, "берегу" ~ "берег" but not "цветущих"
+  // ~ "цветок" (another part of speech with the same root)
+  static bool same_stem(QString a, QString b, bool strict = false) {
+    a = a.toLower().replace(QChar(u'ё'), QChar(u'е'));
+    b = b.toLower().replace(QChar(u'ё'), QChar(u'е'));
+    const int n = std::min(a.size(), b.size());
+    if (n < 4)
+      return a == b;
+    int common = 0;
+    while (common < n && a[common] == b[common])
+      ++common;
+    if (strict)
+      return common >= n - 1;
+    return common >= 4 && common * 10 >= n * 6;
+  }
+
+  // `phrase` ("всё ещё") in `sentence`, word by word
+  static Span find_phrase(const QString& sentence, const QString& phrase,
+                          bool strict = false) {
+    static const QRegularExpression word_re("[\\p{L}-]+");
+    QStringList want;
+    for (auto it = word_re.globalMatch(phrase); it.hasNext();)
+      want << it.next().captured();
+    if (want.isEmpty())
+      return {};
+
+    std::vector<QRegularExpressionMatch> words;
+    for (auto it = word_re.globalMatch(sentence); it.hasNext();)
+      words.push_back(it.next());
+    for (size_t i = 0; i + want.size() <= words.size(); ++i) {
+      int k = 0;
+      while (k < want.size() &&
+             same_stem(words[i + k].captured(), want[k], strict))
+        ++k;
+      if (k == want.size()) {
+        const auto& last = words[i + k - 1];
+        return {int(words[i].capturedStart()),
+                int(last.capturedEnd() - words[i].capturedStart())};
+      }
+    }
+    return {};
+  }
+
+  // The first of `phrases` found in `sentence`, then, if none is there whole,
+  // a long word of one: "нотариально заверенный" -> "с нотариальным
+  // удостоверением". `found` gets the phrase.
+  static Span find_any(const QString& sentence, const QStringList& phrases,
+                       QString* found = nullptr) {
+    for (const auto& phrase : phrases)
+      if (Span span = find_phrase(sentence, phrase); span.len) {
+        if (found)
+          *found = phrase;
+        return span;
+      }
+    static const QRegularExpression word_re("\\p{L}{5,}");
+    for (const auto& phrase : phrases) {
+      QStringList long_words;
+      for (auto it = word_re.globalMatch(phrase); it.hasNext();)
+        long_words << it.next().captured();
+      if (long_words.size() < 2)
+        continue; // a single word was tried whole
+      std::sort(long_words.begin(), long_words.end(),
+                [](const QString& a, const QString& b) {
+                  return a.size() > b.size();
+                });
+      for (const auto& w : long_words)
+        if (Span span = find_phrase(sentence, w); span.len) {
+          if (found)
+            *found = phrase;
+          return span;
+        }
+    }
+    return {};
+  }
+
+  // "банк", "берег", "всё ещё" without stress marks
+  static QStringList dict_options(const std::optional<DictEntry>& entry) {
+    QStringList out;
+    if (entry)
+      for (const auto& s : entry->senses)
+        for (const auto& t : s.translations)
+          for (auto part : QString::fromStdString(t)
+                               .remove(QChar(0x0301))
+                               .split(QRegularExpression("[,;]"))) {
+            part = part.trimmed();
+            if (!part.isEmpty() && !out.contains(part))
+              out << part;
+          }
+    return out;
+  }
+
   // under the word, or above it if there is no room below
   void place() {
     QWidget* p = parentWidget();
@@ -305,8 +583,14 @@ private:
 
   QRect anchor_;
   QString translated_, sentence_;
+  QString sentence_shown_; // the translation in the card, without markup
+  // dictionary translations, to find the word in the sentence translation
+  QStringList options_;
   QLabel *word_, *ipa_, *pos_, *in_context_, *senses_, *context_, *translation_;
-  QPushButton* anki_;
+  QPushButton *anki_, *retranslate_, *improve_;
+  // "↻": only the sentence is translated again, the word in context stays
+  bool sentence_only_ = false;
+  QString fixed_word_;
 
   // what the card is made from
   int shown_ = 0;
@@ -344,26 +628,55 @@ void make_layer_overlay(QWidget& window) {
   layer->setScope("lookupper");
 }
 
-// "неподвижный; ещё, всё ещё" without stress marks, for the translation prompt
-std::string translation_options(const std::optional<DictEntry>& entry) {
-  QStringList senses;
-  if (entry)
-    for (const auto& s : entry->senses) {
-      QStringList ru;
-      for (const auto& t : s.translations)
-        ru << QString::fromStdString(t).remove(QChar(0x0301));
-      if (!ru.isEmpty() && senses.size() < 8)
-        senses << ru.join(", ");
-    }
-  return senses.join("; ").toStdString();
-}
-
 // filled by tools/fetch_dictionaries.py
 std::string data_dir() {
   const char* xdg = std::getenv("XDG_DATA_HOME");
   std::string base =
       xdg && *xdg ? xdg : std::string(std::getenv("HOME")) + "/.local/share";
   return base + "/lookupper";
+}
+
+// Sentence as HTML with the word in <b>: Yandex carries the tag over to the
+// word's translation. Case-insensitive: the sentence may be re-cased.
+std::string marked_html(const std::string& sentence, const std::string& word) {
+  const QString s = QString::fromStdString(sentence),
+                w = QString::fromStdString(word);
+  const int at = w.isEmpty() ? -1 : s.indexOf(w, 0, Qt::CaseInsensitive);
+  if (at < 0)
+    return s.toHtmlEscaped().toStdString();
+  return (s.left(at).toHtmlEscaped() + "<b>" +
+          s.mid(at, w.size()).toHtmlEscaped() + "</b>" +
+          s.mid(at + w.size()).toHtmlEscaped())
+      .toStdString();
+}
+
+// Sentence with the word in **…** for the local model: unlike <b>, which it
+// keeps rarely and which spoils the translation ("make <b>sacrifices</b> to it"
+// -> "будем готовы к этому"), it carries the markdown over to the word's
+// translation, so one request gives both the sentence and the word
+std::string marked_md(const std::string& sentence, const std::string& word) {
+  const QString s = QString::fromStdString(sentence),
+                w = QString::fromStdString(word);
+  const int at = w.isEmpty() ? -1 : s.indexOf(w, 0, Qt::CaseInsensitive);
+  if (at < 0)
+    return sentence;
+  return (s.left(at) + "**" + s.mid(at, w.size()) + "**" + s.mid(at + w.size()))
+      .toStdString();
+}
+
+// Words right after the i-th one in the same sentence, for phrasal verbs:
+// "FELL" -> {"FOR", "HER"}. Punctuation ends the run: "CONTRARY! IS" -> {}
+std::vector<std::string> next_words(const std::vector<Word>& words, size_t i) {
+  std::vector<std::string> out;
+  auto ends_clean = [](const std::string& t) {
+    return !t.empty() && Dictionary::strip_punct(t).size() == t.size();
+  };
+  for (size_t j = i + 1; j < words.size() && out.size() < 2; ++j) {
+    if (words[j].context != words[i].context || !ends_clean(words[j - 1].text))
+      break;
+    out.push_back(Dictionary::strip_punct(words[j].text));
+  }
+  return out;
 }
 
 // Part of the screen around the word, like a screenshot in a mining card: the
@@ -387,10 +700,11 @@ std::string picture_base64(const cv::Mat& screen,
     x2 = std::max(x2, o.line.x2);
     y2 = std::max(y2, o.line.y2);
   }
-  const int pad = h;
-  cv::Rect roi =
-      cv::Rect(cv::Point(x1 - pad, y1 - pad), cv::Point(x2 + pad, y2 + pad)) &
-      cv::Rect(0, 0, screen.cols, screen.rows);
+  // some of the surroundings too: the chat bubble, the panel
+  const int pad_x = 3 * h, pad_y = 2 * h;
+  cv::Rect roi = cv::Rect(cv::Point(x1 - pad_x, y1 - pad_y),
+                          cv::Point(x2 + pad_x, y2 + pad_y)) &
+                 cv::Rect(0, 0, screen.cols, screen.rows);
   if (roi.empty())
     return "";
 
@@ -415,16 +729,19 @@ std::string picture_base64(const cv::Mat& screen,
 } // namespace
 
 int draw_interface(QApplication& app, const cv::Mat& screenshot,
-                   const std::vector<Word>& words,
-                   const std::vector<Block>& blocks) {
+                   Parser& parser, cv::Rect area,
+                   std::optional<cv::Point> cursor) {
 
   static OllamaClient client;
-  std::thread([] {
-    try {
-      client.warmup();
-    } catch (...) {
-    }
-  }).detach();
+  static YandexTranslator yandex;
+  // with Yandex the local model is only a fallback: not kept in memory
+  if (!yandex.configured())
+    std::thread([] {
+      try {
+        client.warmup();
+      } catch (...) {
+      }
+    }).detach();
 
   static Dictionary dictionary;
   const std::string dict_path = data_dir() + "/eng-rus/eng-rus";
@@ -444,6 +761,13 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
   // coordinates from tesseract are in physical pixels, widgets use logical ones
   const double dpr = window.devicePixelRatioF();
 
+  // Words grow when the area is recognized again: new ones are appended, so a
+  // button keeps its index; `order` is their reading order
+  auto words = std::make_shared<std::vector<Word>>(parser.get_words());
+  auto order = std::make_shared<std::vector<size_t>>(words->size());
+  std::iota(order->begin(), order->end(), 0);
+  auto buttons = std::make_shared<std::vector<QPushButton*>>();
+
   // only the answer to the latest click is shown
   auto request_id = std::make_shared<std::atomic<int>>(0);
   auto selected = std::make_shared<QPointer<QPushButton>>();
@@ -452,12 +776,12 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
   static Pronunciations pronunciations(data_dir() + "/audio");
   static AnkiClient anki;
 
-  popup->on_add_to_anki = [popup, selected_word, &screenshot, &words] {
+  popup->on_add_to_anki = [popup, selected_word, &screenshot, words] {
     const int shown = popup->shown();
     popup->set_anki_state(shown, "Adding…", false);
 
     AnkiNote note = popup->note();
-    note.picture_base64 = picture_base64(screenshot, words, *selected_word);
+    note.picture_base64 = picture_base64(screenshot, *words, *selected_word);
 
     QPointer<Popup> target = popup;
     std::thread([note = std::move(note), word = popup->headword(), shown,
@@ -492,88 +816,285 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
       (*selected)->setStyleSheet(kWordStyle);
   };
 
-  for (size_t i = 0; i < words.size(); ++i) {
-    const Word& a = words[i];
-    auto [x1, y1, x2, y2] = a.box;
+  // Translation of the word shown in the card and its sentence
+  struct Request {
+    std::string phrase, context;
+  };
+  auto last = std::make_shared<Request>();
+  auto translate = [popup, request_id](Request r) {
+    const int id = ++*request_id;
+    QPointer<Popup> target = popup;
+    auto deliver = [id, request_id, target](auto update) {
+      QMetaObject::invokeMethod(
+          qApp,
+          [=]() {
+            if (target && id == *request_id)
+              update(target.data());
+          },
+          Qt::QueuedConnection);
+    };
 
-    QPushButton* btn = new QPushButton("", &window);
-    btn->setGeometry(x1 / dpr - 3, y1 / dpr - 3, (x2 - x1) / dpr + 7,
-                     (y2 - y1) / dpr + 7);
-    btn->setStyleSheet(kWordStyle);
+    std::thread([r = std::move(r), id, request_id, deliver, target]() {
+      const std::string sentence_en = OllamaClient::sentence_case(
+          QString::fromStdString(r.context).simplified().toStdString());
+      if (yandex.configured()) {
+        try {
+          const std::string html =
+              yandex.translate_html(marked_html(sentence_en, r.phrase));
+          deliver([html = QString::fromStdString(html)](Popup* p) {
+            p->show_marked(html);
+            p->finish_translation();
+          });
+          return;
+        } catch (const std::exception& e) {
+          // the local model translates instead
+          std::cerr << e.what() << "\n";
+        }
+      }
 
-    const std::string& context = a.context;
+      auto cancelled = [id, request_id] { return id != *request_id; };
+      try {
+        // a newer click cancels this request, so ollama doesn't queue stale
+        // answers.
+        // One request: on the CPU each takes several seconds. The word is
+        // marked, so the model marks its translation too (see marked_md)
+        client.translate(
+            marked_md(sentence_en, r.phrase),
+            [&](const std::string& piece) {
+              deliver([piece](Popup* p) { p->append_translation(piece); });
+            },
+            cancelled);
+        deliver([](Popup* p) { p->show_marked_final(); });
 
-    QObject::connect(
-        btn, &QPushButton::clicked,
-        [btn, i, word = a.text, context, popup, request_id, selected,
-         selected_word, &dict_error]() {
+        // neither marked nor a dictionary translation found in the sentence:
+        // the word alone
+        bool found = false;
+        QMetaObject::invokeMethod(
+            qApp,
+            [&] { found = target && id == *request_id && target->word_found(); },
+            Qt::BlockingQueuedConnection);
+        if (!found) {
+          // lowercase: "ROGUE" gets an answer in caps
+          std::string alone;
+          client.translate(
+              QString::fromStdString(r.phrase).toLower().toStdString(),
+              [&](const std::string& piece) { alone += piece; }, cancelled);
+          // the first of several: "ответственный, непредсказуемый, …"
+          QString word = QString::fromStdString(alone)
+                             .remove("**")
+                             .section(QRegularExpression("[,;/\\n]"), 0, 0);
+          deliver([word = word.trimmed().remove(QRegularExpression("[.!]+$"))](
+                      Popup* p) { p->set_word_translation(word); });
+        }
+        deliver([](Popup* p) { p->finish_translation(); });
+      } catch (const RequestCancelled&) {
+      } catch (const std::exception& e) {
+        deliver([msg = QString::fromStdString(e.what())](Popup* p) {
+          p->set_translation_error(msg);
+        });
+      }
+    }).detach();
+  };
+
+  // another translation of the sentence alone, with some randomness: the same
+  // request at temperature 0 would give the same answer
+  popup->on_retranslate = [popup, request_id, last] {
+    popup->restart_sentence();
+    const int id = ++*request_id;
+    QPointer<Popup> target = popup;
+    auto deliver = [id, request_id, target](auto update) {
+      QMetaObject::invokeMethod(
+          qApp,
+          [=]() {
+            if (target && id == *request_id)
+              update(target.data());
+          },
+          Qt::QueuedConnection);
+    };
+    std::thread([sentence_en = OllamaClient::sentence_case(
+                     QString::fromStdString(last->context)
+                         .simplified()
+                         .toStdString()),
+                 phrase = last->phrase, id, request_id, deliver] {
+      try {
+        client.translate(
+            marked_md(sentence_en, phrase),
+            [&](const std::string& piece) {
+              deliver([piece](Popup* p) { p->append_sentence(piece); });
+            },
+            [id, request_id] { return id != *request_id; }, 0.8);
+        deliver([](Popup* p) { p->finish_translation(); });
+      } catch (const RequestCancelled&) {
+      } catch (const std::exception& e) {
+        deliver([msg = QString::fromStdString(e.what())](Popup* p) {
+          p->set_translation_error(msg);
+        });
+      }
+    }).detach();
+  };
+
+  // Recognizes the area again: a button over the cursor until a word is
+  // clicked
+  auto* improve = new QPushButton("Improve recognition", &window);
+  improve->setObjectName("anki");
+  improve->setStyleSheet(kPopupStyle);
+  improve->setCursor(Qt::PointingHandCursor);
+  improve->setToolTip("Recognize the area again and add the missed words");
+  improve->adjustSize();
+  {
+    const QPoint at = cursor ? QPoint(cursor->x, cursor->y) / dpr
+                             : QPoint(area.x + area.width / 2, area.y) / dpr;
+    const int screen_w = screenshot.cols / dpr;
+    improve->move(std::clamp(at.x() - improve->width() / 2, 0,
+                             std::max(0, screen_w - improve->width())),
+                  std::max(0, at.y() - improve->height() - 12));
+  }
+
+  auto on_word_click = [popup, request_id, selected, selected_word, words,
+                        translate, last, improve,
+                        &dict_error](QPushButton* btn, size_t i) {
+    improve->hide();
+    const std::string ocr_word = (*words)[i].text,
+                      ocr_context = (*words)[i].context;
 #ifdef __MY_LOG__
-          std::cout << "------>" << word << " | " << context << "\n\n";
+    std::cout << "------>" << ocr_word << " | " << ocr_context << "\n\n";
 #endif
 
-          if (*selected)
-            (*selected)->setStyleSheet(kWordStyle);
-          *selected = btn;
-          *selected_word = i;
-          btn->setStyleSheet(kSelectedWordStyle);
+    if (*selected)
+      (*selected)->setStyleSheet(kWordStyle);
+    *selected = btn;
+    *selected_word = i;
+    btn->setStyleSheet(kSelectedWordStyle);
 
-          auto entry =
-              dict_error.isEmpty() ? dictionary.lookup(word) : std::nullopt;
-          popup->show_word(btn->geometry(), word, context, entry, dict_error);
+    // OCR misreads fixed before anything else: "INDEEP" -> "INDEED"
+    const bool has_dict = dict_error.isEmpty();
+    const std::string word =
+        has_dict ? dictionary.correct_text(ocr_word) : ocr_word;
+    const std::string context =
+        has_dict ? dictionary.correct_text(ocr_context) : ocr_context;
 
-          const int id = ++*request_id;
-          QPointer<Popup> target = popup;
-          auto deliver = [id, request_id, target](auto update) {
-            QMetaObject::invokeMethod(
-                qApp,
-                [=]() {
-                  if (target && id == *request_id)
-                    update(target.data());
-                },
-                Qt::QueuedConnection);
-          };
+    // "FELL" in "FELL FOR HER" is looked up and translated as "fall for"
+    std::string phrase = Dictionary::strip_punct(word);
+    std::optional<DictEntry> entry;
+    if (has_dict) {
+      auto next = next_words(*words, i);
+      for (auto& w : next)
+        w = dictionary.correct_word(w);
+      if (auto phrasal = dictionary.lookup_phrasal(word, next)) {
+        entry = std::move(phrasal->first);
+        for (size_t k = 0; k < phrasal->second; ++k)
+          phrase += " " + next[k];
+      } else {
+        entry = dictionary.lookup(word);
+      }
+    }
+    popup->show_word(btn->geometry(), phrase, context, entry, dict_error);
 
-          std::thread([word, context, options = translation_options(entry), id,
-                       request_id, deliver]() {
-            std::string answer;
-            try {
-              // a newer click cancels this request, so ollama doesn't queue
-              // stale answers
-              client.translate(
-                  Dictionary::strip_punct(word),
-                  QString::fromStdString(context).simplified().toStdString(),
-                  options,
-                  [&](const std::string& piece) {
-                    answer += piece;
-                    deliver(
-                        [piece](Popup* p) { p->append_translation(piece); });
-                  },
-                  [id, request_id] { return id != *request_id; });
+    *last = {phrase, context};
+    translate(*last);
+  };
 
-              // small models sometimes stop after the word line: ask for the
-              // sentence separately
-              const QString text = QString::fromStdString(answer).trimmed();
-              const int nl = text.indexOf('\n');
-              const bool has_sentence =
-                  nl < 0 ? text.count(' ') >= 3
-                         : !text.mid(nl + 1).trimmed().isEmpty();
-              if (!has_sentence)
-                client.translate_sentence(
-                    QString::fromStdString(context).simplified().toStdString(),
-                    [&](const std::string& piece) {
-                      deliver([piece](Popup* p) { p->append_sentence(piece); });
-                    },
-                    [id, request_id] { return id != *request_id; });
-              deliver([](Popup* p) { p->finish_translation(); });
-            } catch (const RequestCancelled&) {
-            } catch (const std::exception& e) {
-              deliver([msg = QString::fromStdString(e.what())](Popup* p) {
-                p->set_translation_error(msg);
-              });
+  auto place_button = [dpr](QPushButton* btn, const Word& w) {
+    auto [x1, y1, x2, y2] = w.box;
+    btn->setGeometry(x1 / dpr - 3, y1 / dpr - 3, (x2 - x1) / dpr + 7,
+                     (y2 - y1) / dpr + 7);
+  };
+  auto add_button = [&window, popup, buttons, words, place_button,
+                     on_word_click](size_t i) {
+    QPushButton* btn = new QPushButton("", &window);
+    place_button(btn, (*words)[i]);
+    btn->setStyleSheet(kWordStyle);
+    QObject::connect(btn, &QPushButton::clicked,
+                     [btn, i, on_word_click] { on_word_click(btn, i); });
+    btn->show();
+    // the card stays on top of the words
+    btn->stackUnder(popup);
+    buttons->push_back(btn);
+  };
+  for (size_t i = 0; i < words->size(); ++i)
+    add_button(i);
+  // above the word boxes it may cover
+  improve->raise();
+
+  // Recognizes the area again at other settings and adds what the first pass
+  // missed: 3x for small text, then straightened italics (comics). The card
+  // is shown again if the sentence of its word has changed. `report` gets the
+  // result: "+3 words", or the error.
+  using Report = std::function<void(const QString& result, const QString& error)>;
+  auto improve_ocr = [popup, &parser, &screenshot, area, words, order, buttons,
+                      place_button, add_button, selected, selected_word,
+                      on_word_click](Report report) {
+    std::thread([=, &parser, &screenshot] {
+      std::vector<Word> extra;
+      QString error;
+      try {
+        for (Parser::Options o : {Parser::Options{3.0, 0.0},
+                                  Parser::Options{2.0, 0.15}}) {
+          parser.process(screenshot(area), area.tl(), o);
+          const auto& w = parser.get_words();
+          extra.insert(extra.end(), w.begin(), w.end());
+        }
+      } catch (const std::exception& e) {
+        error = QString::fromStdString(e.what());
+      }
+      QMetaObject::invokeMethod(
+          qApp,
+          [=, extra = std::move(extra)]() mutable {
+            if (!error.isEmpty()) {
+              report("OCR failed", error);
+              return;
             }
-          }).detach();
-        });
-  }
+            const size_t before = words->size(), sel = *selected_word;
+            const std::string old_text = (*words)[sel].text,
+                              old_context = (*words)[sel].context;
+            int added = 0;
+            for (size_t i : merge_words(*words, *order, std::move(extra))) {
+              if (i >= before) {
+                add_button(i);
+                ++added;
+              } else {
+                place_button((*buttons)[i], (*words)[i]);
+              }
+            }
+            if (popup->isVisible() && *selected &&
+                ((*words)[sel].text != old_text ||
+                 (*words)[sel].context != old_context))
+              on_word_click(selected->data(), sel);
+            report(added ? QString("+%1 words").arg(added)
+                         : QString("Nothing new"),
+                   "");
+          },
+          Qt::QueuedConnection);
+    }).detach();
+  };
+
+  QObject::connect(improve, &QPushButton::clicked, [improve, improve_ocr] {
+    improve->setEnabled(false);
+    improve->setText("Recognizing…");
+    improve->adjustSize();
+    QPointer<QPushButton> target = improve;
+    improve_ocr([target](const QString& result, const QString& error) {
+      if (!target)
+        return;
+      target->setText(result);
+      if (!error.isEmpty())
+        target->setToolTip(error);
+      target->setEnabled(true);
+      target->adjustSize();
+      target->raise();
+    });
+  });
+
+  popup->on_improve_ocr = [popup, improve_ocr] {
+    popup->set_improve_state("Recognizing…", false, "");
+    QPointer<Popup> target = popup;
+    improve_ocr([target](const QString& result, const QString& error) {
+      if (target)
+        target->set_improve_state(result, true,
+                                  error.isEmpty() ? "Recognize the area again"
+                                                  : error);
+    });
+  };
 
   window.show();
 

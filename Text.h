@@ -146,21 +146,58 @@ inline bool continues(const Word& prev, const Word& next, int h) {
   return next.line.x1 < prev.line.x2 && prev.line.x1 < next.line.x2;
 }
 
+// A line ended by Enter rather than by wrapping, and a new sentence after it:
+// "Good evening, Alexander," / "Sorry for messaging so late." A wrapped line
+// is full: the next word would not fit at its end. `right` is the right edge
+// of the paragraph. Only a Capitalized next word counts: in ALL CAPS text
+// (comics) and before "I" the case tells nothing.
+inline bool line_break_sentence(const Word& prev, const Word& next, int right) {
+  if (next.line.y1 == prev.line.y1 && next.line.y2 == prev.line.y2)
+    return false;
+  const std::string& t = next.text;
+  if (t.empty() || !std::isupper(static_cast<unsigned char>(t[0])) ||
+      std::none_of(t.begin(), t.end(),
+                   [](unsigned char c) { return std::islower(c); }))
+    return false;
+  if (t == "I" || (t.size() > 1 && t[0] == 'I' && t[1] == '\''))
+    return false;
+  const int space = (prev.line.y2 - prev.line.y1) / 2;
+  return prev.box.x2 + space + (next.box.x2 - next.box.x1) < right;
+}
+
 // Context of a word is its sentence: neighbours in the same text up to . ! ?
-// Built from filtered words, so it spans line breaks and has no OCR noise from
-// icons.
+// or a line break before a new sentence. Built from filtered words, so it
+// spans line breaks and has no OCR noise from icons.
 inline void build_contexts(std::vector<Word>& words) {
+  // right edge of each paragraph, for line_break_sentence
+  std::vector<int> right;
+  for (const auto& w : words) {
+    if (w.para_id < 0)
+      continue;
+    if (static_cast<size_t>(w.para_id) >= right.size())
+      right.resize(w.para_id + 1, 0);
+    right[w.para_id] = std::max(right[w.para_id], w.line.x2);
+  }
+  auto sentence_ends = [&](const Word& prev, const Word& next) {
+    if (ends_sentence(prev.text))
+      return true;
+    if (prev.para_id < 0 || next.para_id < 0)
+      return false;
+    return line_break_sentence(
+        prev, next, std::max(right[prev.para_id], right[next.para_id]));
+  };
+
   const size_t max_side = 40;
   for (size_t i = 0; i < words.size(); ++i) {
     const int h = std::max(1, words[i].line.y2 - words[i].line.y1);
     size_t b = i;
     while (b > 0 && i - b < max_side && continues(words[b - 1], words[b], h) &&
-           !ends_sentence(words[b - 1].text))
+           !sentence_ends(words[b - 1], words[b]))
       --b;
     size_t e = i;
     while (e + 1 < words.size() && e - i < max_side &&
            continues(words[e], words[e + 1], h) &&
-           !ends_sentence(words[e].text))
+           !sentence_ends(words[e], words[e + 1]))
       ++e;
 
     std::string context;
@@ -171,6 +208,124 @@ inline void build_contexts(std::vector<Word>& words) {
     }
     words[i].context = std::move(context);
   }
+}
+
+// Words of another recognition pass added to `words`: new ones are appended
+// (indices of the old ones stay), a duplicate replaces the old word only if it
+// is much more confident. `order` is the reading order of `words`; a new word
+// goes into the line of its neighbour. Contexts are rebuilt. Returns indices
+// of the added and changed words.
+inline std::vector<size_t> merge_words(std::vector<Word>& words,
+                                       std::vector<size_t>& order,
+                                       std::vector<Word> extra) {
+  auto area = [](const Rect& r) {
+    return double(r.x2 - r.x1) * double(r.y2 - r.y1);
+  };
+  // share of the smaller box covered by the other one
+  auto overlap = [&](const Rect& a, const Rect& b) {
+    const int w = std::min(a.x2, b.x2) - std::max(a.x1, b.x1),
+              h = std::min(a.y2, b.y2) - std::max(a.y1, b.y1);
+    if (w <= 0 || h <= 0)
+      return 0.0;
+    return double(w) * h / std::max(1.0, std::min(area(a), area(b)));
+  };
+  auto same_line = [](const Rect& a, const Rect& b) {
+    const int h = std::min(a.y2, b.y2) - std::max(a.y1, b.y1);
+    return h * 2 >= std::min(a.y2 - a.y1, b.y2 - b.y1);
+  };
+
+  int next_para = 0;
+  for (const auto& w : words)
+    next_para = std::max(next_para, w.para_id + 1);
+  std::vector<std::pair<int, int>> para_map; // pass para id -> new id
+
+  // another pass is a second guess: only confident real words are taken,
+  // not "Fi" or "4" read from a border
+  auto plausible = [](const Word& w) {
+    const int letters = std::count_if(w.text.begin(), w.text.end(), [](char c) {
+      return std::isalpha(static_cast<unsigned char>(c));
+    });
+    return w.confidence >= 70 &&
+           (letters >= 2 || w.text == "I" || w.text == "A");
+  };
+
+  std::vector<size_t> changed;
+  for (auto& e : extra) {
+    if (!plausible(e))
+      continue;
+    size_t dup = words.size();
+    for (size_t i = 0; i < words.size() && dup == words.size(); ++i)
+      if (overlap(e.box, words[i].box) > 0.3)
+        dup = i;
+    if (dup < words.size()) {
+      if (e.confidence > words[dup].confidence + 20) {
+        words[dup].text = e.text;
+        words[dup].confidence = e.confidence;
+        words[dup].box = e.box;
+        changed.push_back(dup);
+      }
+      continue;
+    }
+
+    // the nearest word on the same line, not in another column
+    const int h = std::max(1, e.line.y2 - e.line.y1);
+    size_t mate = words.size();
+    int best = 3 * h;
+    for (size_t i = 0; i < words.size(); ++i) {
+      if (!same_line(e.line, words[i].line))
+        continue;
+      const int gap = std::max(words[i].box.x1 - e.box.x2,
+                               e.box.x1 - words[i].box.x2);
+      if (gap < best) {
+        best = gap;
+        mate = i;
+      }
+    }
+
+    size_t at = order.size(); // position in the reading order
+    if (mate < words.size()) {
+      const Word& m = words[mate];
+      e.para_id = m.para_id;
+      e.line = Rect(std::min(m.line.x1, e.box.x1), m.line.y1,
+                    std::max(m.line.x2, e.box.x2), m.line.y2);
+      // after the last word of the line to the left of it, or before the line
+      const size_t none = order.size() + 1;
+      size_t first = none, after = none;
+      for (size_t k = 0; k < order.size(); ++k) {
+        const Word& o = words[order[k]];
+        if (o.para_id != m.para_id || o.line.y1 != m.line.y1 ||
+            o.line.y2 != m.line.y2)
+          continue;
+        if (first == none)
+          first = k;
+        if (o.box.x1 < e.box.x1)
+          after = k + 1;
+      }
+      at = after != none ? after : first != none ? first : order.size();
+    } else {
+      // a line of its own: before the first line below it
+      for (at = 0; at < order.size(); ++at)
+        if (words[order[at]].line.y1 >= e.line.y2)
+          break;
+      auto it = std::find_if(para_map.begin(), para_map.end(),
+                             [&](auto& p) { return p.first == e.para_id; });
+      if (it == para_map.end())
+        it = para_map.insert(para_map.end(), {e.para_id, next_para++});
+      e.para_id = it->second;
+    }
+
+    words.push_back(std::move(e));
+    order.insert(order.begin() + at, words.size() - 1);
+    changed.push_back(words.size() - 1);
+  }
+
+  std::vector<Word> seq;
+  for (size_t i : order)
+    seq.push_back(words[i]);
+  build_contexts(seq);
+  for (size_t k = 0; k < order.size(); ++k)
+    words[order[k]].context = std::move(seq[k].context);
+  return changed;
 }
 
 #endif // __OCR_TEXT__

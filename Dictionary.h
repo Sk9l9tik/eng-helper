@@ -68,16 +68,100 @@ public:
   // Looks up the word as is, then its base forms: "copiously" -> "copious",
   // "shoes" -> "shoe", then with typical OCR mistakes fixed: "seeklng" ->
   // "seeking"
+  // Contractions fall back to their main word: "we'll" -> "we", "wouldn't" ->
+  // "would"
   std::optional<DictEntry> lookup(const std::string& raw_word) {
-    std::string word = to_lower(strip_punct(raw_word));
+    std::string word = normalize(raw_word);
     if (word.empty())
       return std::nullopt;
 
-    if (auto entry = lookup_exact(word))
-      return entry;
-    for (const auto& variant : ocr_variants(word))
-      if (auto entry = lookup_exact(variant))
+    for (const auto& w : {word, uncontracted(word)}) {
+      if (w.empty())
+        continue;
+      if (auto entry = lookup_exact(w))
         return entry;
+      for (const auto& variant : ocr_variants(w))
+        if (auto entry = lookup_exact(variant))
+          return entry;
+    }
+    return std::nullopt;
+  }
+
+  // OCR misreads fixed with the dictionary, word by word: "THIS DEMON WAS
+  // INDEEP INTIMIPATED BY ME/" -> "THIS DEMON WAS INDEED INTIMIDATED BY ME!".
+  // Known words, and unknown ones without a single close dictionary word
+  // (names, slang), stay as they are.
+  std::string correct_text(const std::string& text) const {
+    std::string out, token;
+    auto flush = [&] {
+      if (token.empty())
+        return;
+      const std::string core = strip_punct(token);
+      if (!core.empty()) {
+        const size_t at = token.find(core);
+        token.replace(at, core.size(), correct_word(core));
+        // "!" read as "/" at the end of a word: "ME/"
+        if (token.back() == '/' && at + core.size() == token.size() - 1)
+          token.back() = '!';
+      }
+      out += token;
+      token.clear();
+    };
+    for (char c : text) {
+      if (std::isspace(static_cast<unsigned char>(c))) {
+        flush();
+        out += c;
+      } else {
+        token += c;
+      }
+    }
+    flush();
+    return out;
+  }
+
+  // Lowercase, typographic apostrophes as "'", no punctuation or quotes
+  // around: "‘Tomorrow’s’" -> "tomorrow's"
+  static std::string normalize(const std::string& raw_word) {
+    static const char* apostrophes[] = {"\u2019", "\u2018", "\u02BC", "\u00B4",
+                                        "`"};
+    std::string w = raw_word;
+    for (const char* a : apostrophes)
+      for (size_t at; (at = w.find(a)) != std::string::npos;)
+        w.replace(at, std::strlen(a), "'");
+    w = to_lower(strip_punct(w));
+    // quotes around the word, "classes'" (plural possessive) -> "classes"
+    size_t b = w.find_first_not_of('\''), e = w.find_last_not_of('\'');
+    return b == std::string::npos ? "" : w.substr(b, e - b + 1);
+  }
+
+  // Phrasal verb starting with the word: "fell" + {"for", "her"} -> "fall
+  // for". `next` are the words right after it. Returns the entry and how many
+  // of `next` it takes
+  std::optional<std::pair<DictEntry, size_t>>
+  lookup_phrasal(const std::string& raw_word,
+                 const std::vector<std::string>& next) {
+    static const char* particles[] = {
+        "up",   "down", "out",     "off",     "on",     "in",    "over",
+        "away", "back", "along",   "through", "around", "about", "apart",
+        "for",  "into", "forward", "after",   "across", "by"};
+    std::string word = normalize(raw_word);
+    if (word.empty() || next.empty() ||
+        std::find(std::begin(particles), std::end(particles),
+                  to_lower(next[0])) == std::end(particles))
+      return std::nullopt;
+
+    std::vector<std::string> bases = base_forms(word);
+    if (auto it = irregular_verbs().find(word); it != irregular_verbs().end())
+      bases.insert(bases.begin(), it->second);
+    // "get along with" before "get along"
+    for (size_t n = std::min<size_t>(next.size(), 2); n > 0; --n) {
+      std::string tail;
+      for (size_t i = 0; i < n; ++i)
+        tail += " " + to_lower(next[i]);
+      for (const auto& base : bases)
+        if (auto entry = read_entry(base + tail))
+          return std::pair{*entry, n};
+    }
     return std::nullopt;
   }
 
@@ -94,6 +178,105 @@ public:
   }
 
 private:
+  // "we'll" -> "we", "wouldn't" -> "would", "won't" -> "will", "" if the word
+  // is not a contraction
+  static std::string uncontracted(const std::string& w) {
+    static const std::pair<const char*, const char*> irregular[] = {
+        {"won't", "will"}, {"can't", "can"}, {"shan't", "shall"},
+        {"ain't", "be"}};
+    for (auto [from, to] : irregular)
+      if (w == from)
+        return to;
+    for (const char* suffix : {"n't", "'m", "'re", "'ve", "'ll", "'d", "'s"}) {
+      const size_t n = std::strlen(suffix);
+      if (w.size() > n && w.compare(w.size() - n, n, suffix) == 0)
+        return w.substr(0, w.size() - n);
+    }
+    return "";
+  }
+
+public:
+  // A word with a misread letter or two -> the dictionary word it was, in the
+  // same case: "INDEEP" -> "INDEED". First the usual OCR confusions, then any
+  // one letter, if that gives exactly one dictionary word.
+  std::string correct_word(const std::string& word) const {
+    // "MIP-BTAGE" -> "MID-STAGE": each part on its own
+    if (const size_t dash = word.find('-');
+        dash != std::string::npos && !known(normalize(word)))
+      return correct_word(word.substr(0, dash)) + "-" +
+             correct_word(word.substr(dash + 1));
+
+    const std::string w = normalize(word);
+    if (w.size() < 4 || known(w) ||
+        std::any_of(w.begin(), w.end(), [](unsigned char c) {
+          return !std::isalnum(c) && c != '\'' && c != '-';
+        }))
+      return word;
+
+    static const std::pair<const char*, const char*> confusions[] = {
+        {"p", "d"},  {"d", "p"},  {"rn", "m"}, {"m", "rn"}, {"cl", "d"},
+        {"vv", "w"}, {"l", "i"},  {"i", "l"},  {"1", "l"},  {"1", "i"},
+        {"0", "o"},  {"5", "s"},  {"8", "b"},  {"e", "c"},  {"c", "e"},
+        {"u", "v"},  {"v", "u"},  {"h", "n"},  {"n", "h"},  {"t", "f"},
+        {"f", "t"},  {"k", "x"},  {"g", "q"}};
+    std::string fixed;
+    for (auto [from, to] : confusions) {
+      const size_t n = std::strlen(from);
+      for (size_t at = w.find(from); at != std::string::npos && fixed.empty();
+           at = w.find(from, at + 1)) {
+        std::string v = w;
+        v.replace(at, n, to);
+        if (known(v))
+          fixed = v;
+      }
+      if (!fixed.empty())
+        break;
+    }
+    // any letter: too many short words are one letter apart
+    if (fixed.empty() && w.size() >= 5) {
+      int found = 0;
+      for (size_t at = 0; at < w.size() && found < 2; ++at)
+        for (char c = 'a'; c <= 'z' && found < 2; ++c) {
+          if (c == w[at])
+            continue;
+          std::string v = w;
+          v[at] = c;
+          if (known(v) && v != fixed) {
+            fixed = v;
+            ++found;
+          }
+        }
+      if (found != 1)
+        fixed.clear();
+    }
+    if (fixed.empty())
+      return word;
+
+    // the case of the original: "INDEEP" -> "INDEED", "Indeep" -> "Indeed"
+    const bool has_lower = std::any_of(word.begin(), word.end(), [](unsigned char c) {
+      return std::islower(c);
+    });
+    if (!has_lower)
+      for (char& c : fixed)
+        c = std::toupper(static_cast<unsigned char>(c));
+    else if (std::isupper(static_cast<unsigned char>(word[0])))
+      fixed[0] = std::toupper(static_cast<unsigned char>(fixed[0]));
+    return fixed;
+  }
+
+private:
+  // Is there an entry for the word or its base form, without reading it
+  bool known(const std::string& w) const {
+    if (index_.count(w) || irregular_verbs().count(w))
+      return true;
+    if (const std::string u = uncontracted(w); !u.empty() && index_.count(u))
+      return true;
+    for (const auto& b : base_forms(w))
+      if (index_.count(b))
+        return true;
+    return false;
+  }
+
   // one-character substitutions of letters tesseract often confuses
   static std::vector<std::string> ocr_variants(const std::string& w) {
     static const std::pair<char, char> swaps[] = {
@@ -110,19 +293,74 @@ private:
   }
 
   std::optional<DictEntry> lookup_exact(const std::string& word) {
-    for (const auto& candidate : base_forms(word)) {
-      auto it = index_.find(candidate);
-      if (it == index_.end())
-        continue;
-
-      DictEntry entry;
-      entry.headword = candidate;
-      for (auto [offset, size] : it->second)
-        parse_article(read_article(offset, size), entry);
-      if (!entry.senses.empty())
+    if (auto entry = read_entry(word))
+      return entry;
+    // "would", "has": forms the dictionary has no entry for. Before the
+    // suffixes, which make "has" -> "ha"
+    if (auto it = irregular_verbs().find(word); it != irregular_verbs().end())
+      if (auto entry = read_entry(it->second))
         return entry;
-    }
+    for (const auto& candidate : base_forms(word))
+      if (auto entry = read_entry(candidate))
+        return entry;
     return std::nullopt;
+  }
+
+  std::optional<DictEntry> read_entry(const std::string& key) {
+    auto it = index_.find(key);
+    if (it == index_.end())
+      return std::nullopt;
+
+    DictEntry entry;
+    entry.headword = key;
+    for (auto [offset, size] : it->second)
+      parse_article(read_article(offset, size), entry);
+    if (entry.senses.empty())
+      return std::nullopt;
+    return entry;
+  }
+
+  // forms of common verbs, base_forms() covers the regular ones
+  static const std::unordered_map<std::string, std::string>& irregular_verbs() {
+    static const std::unordered_map<std::string, std::string> forms = {
+        {"fell", "fall"},     {"fallen", "fall"},   {"got", "get"},
+        {"gotten", "get"},    {"gave", "give"},     {"given", "give"},
+        {"went", "go"},       {"gone", "go"},       {"came", "come"},
+        {"took", "take"},     {"taken", "take"},    {"made", "make"},
+        {"put", "put"},       {"set", "set"},       {"ran", "run"},
+        {"broke", "break"},   {"broken", "break"},  {"brought", "bring"},
+        {"threw", "throw"},   {"thrown", "throw"},  {"held", "hold"},
+        {"kept", "keep"},     {"let", "let"},       {"left", "leave"},
+        {"stood", "stand"},   {"sat", "sit"},       {"woke", "wake"},
+        {"woken", "wake"},    {"wore", "wear"},     {"worn", "wear"},
+        {"cut", "cut"},       {"shut", "shut"},     {"blew", "blow"},
+        {"blown", "blow"},    {"drew", "draw"},     {"drawn", "draw"},
+        {"drove", "drive"},   {"driven", "drive"},  {"ate", "eat"},
+        {"eaten", "eat"},     {"found", "find"},    {"fought", "fight"},
+        {"grew", "grow"},     {"grown", "grow"},    {"hung", "hang"},
+        {"laid", "lay"},      {"led", "lead"},      {"lit", "light"},
+        {"paid", "pay"},      {"rode", "ride"},     {"ridden", "ride"},
+        {"rose", "rise"},     {"risen", "rise"},    {"saw", "see"},
+        {"seen", "see"},      {"sold", "sell"},     {"sent", "send"},
+        {"shook", "shake"},   {"shaken", "shake"},  {"shot", "shoot"},
+        {"spoke", "speak"},   {"spoken", "speak"},  {"stuck", "stick"},
+        {"struck", "strike"}, {"swore", "swear"},   {"sworn", "swear"},
+        {"told", "tell"},     {"thought", "think"}, {"tore", "tear"},
+        {"torn", "tear"},     {"wound", "wind"},
+        {"won", "win"},       {"wrote", "write"},   {"written", "write"},
+        {"did", "do"},        {"done", "do"},       {"knew", "know"},
+        {"known", "know"},    {"caught", "catch"},  {"bought", "buy"},
+        {"built", "build"},   {"dug", "dig"},       {"fed", "feed"},
+        {"felt", "feel"},     {"flew", "fly"},      {"flown", "fly"},
+        {"forgot", "forget"}, {"heard", "hear"},    {"hid", "hide"},
+        {"hidden", "hide"},   {"meant", "mean"},    {"met", "meet"},
+        {"slept", "sleep"},   {"spent", "spend"},   {"swept", "sweep"},
+        {"was", "be"},        {"were", "be"},
+        {"been", "be"},       {"is", "be"},         {"are", "be"},
+        {"am", "be"},         {"has", "have"},      {"had", "have"},
+        {"does", "do"},       {"would", "will"},    {"could", "can"},
+        {"might", "may"}};
+    return forms;
   }
 
   static std::string to_lower(std::string s) {

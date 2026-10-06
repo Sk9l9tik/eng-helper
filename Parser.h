@@ -29,6 +29,12 @@
 
 // TODO: wrap this code into namespace
 
+// How Parser::process recognizes an image
+struct OcrOptions {
+  double scale = 0; // 0: 2x for a part of the screen, 1x for the whole
+  double shear = 0; // > 0 straightens italics leaning right
+};
+
 class Parser {
 public:
   // Loading a model takes ~150 ms, so all instances are loaded in parallel.
@@ -55,7 +61,12 @@ public:
   // instance: tesseract barely scales with OpenMP threads. Almost all the time
   // is LSTM recognition, proportional to the amount of text; more strips than
   // instances (for balance) and other page segmentation modes were no faster.
-  void process(const cv::Mat& image) {
+  // `offset` is where `image` is on the screen: word boxes are in screen
+  // coordinates. Words cut by the image edge are dropped: `image` is usually
+  // a part of the screen.
+  using Options = OcrOptions;
+  void process(const cv::Mat& image, cv::Point offset = {},
+               Options options = {}) {
     if (image.empty())
       throw std::runtime_error("Empty image passed to Parser");
 
@@ -68,11 +79,33 @@ public:
       gray = image;
     else
       throw std::runtime_error("Unsupported number of channels in image");
-    img_size_ = gray.size();
+    // small text (~7 px x-height, a chat or a caption) is mostly lost at screen
+    // size; a part of the screen is cheap to recognize at 2x, the whole one
+    // is not
+    const double scale = options.scale > 0                    ? options.scale
+                         : gray.total() <= kMaxUpscaledArea ? 2.0
+                                                            : 1.0;
+    if (scale != 1.0)
+      cv::resize(gray, gray, cv::Size(), scale, scale, cv::INTER_CUBIC);
 
-    const cv::Mat norm = dark_text_on_light(gray);
-    const std::vector<int> cuts =
-        strip_cuts(norm, static_cast<int>(apis_.size()));
+    cv::Mat norm = dark_text_on_light(gray);
+    // x' = x + shear * y: lower rows move right, so a letter leaning right
+    // stands upright
+    const double shear = options.shear;
+    if (shear > 0) {
+      const cv::Matx23d m(1.0, shear, 0.0, 0.0, 1.0, 0.0);
+      cv::warpAffine(norm, norm, m,
+                     cv::Size(norm.cols + static_cast<int>(shear * norm.rows),
+                              norm.rows),
+                     cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(255));
+    }
+    img_size_ = norm.size();
+    // a strip much lower than the overlap recognizes the same lines several
+    // times: a small image gets fewer strips
+    constexpr int min_strip = 150;
+    const std::vector<int> cuts = strip_cuts(
+        norm, std::clamp(norm.rows / min_strip, 1,
+                         static_cast<int>(apis_.size())));
     // A cut can still go through a line (a video frame has no empty rows), so
     // strips overlap by `overlap` rows and each keeps only words centered in
     // its own rows: every line up to 2 * `overlap` high is seen whole once.
@@ -113,12 +146,17 @@ public:
       int para_count = 0;
       for (auto& b : st.blocks) {
         b.id += block_offset;
+        to_screen(b.box, offset, scale, shear);
         blocks_.push_back(std::move(b));
       }
       for (auto& w : st.words) {
+        if (touches_edge(w.box))
+          continue;
         if (w.block_id >= 0)
           w.block_id += block_offset;
         para_count = std::max(para_count, w.para_id + 1);
+        to_screen(w.box, offset, scale, shear);
+        to_screen(w.line, offset, scale, shear);
         w.para_id += para_offset;
         words_.push_back(std::move(w));
       }
@@ -126,6 +164,26 @@ public:
     }
     fix_misread_i(words_);
     build_contexts(words_);
+  }
+
+  // Screens mix dark text on light (a white banner, a link preview) and light
+  // text on dark (a dark chat). Text is a minority of pixels around it, so a
+  // large median gives the local background, and the distance to it gives text
+  // of either polarity as dark on light. The median runs on a downscaled copy:
+  // full size is slow.
+  static cv::Mat dark_text_on_light(const cv::Mat& gray) {
+    constexpr int scale = 4;
+    constexpr int kernel = 25; // ~100 px in the full image: wider than a glyph,
+                               // narrower than a panel
+    cv::Mat small, bg;
+    cv::resize(gray, small, cv::Size(), 1.0 / scale, 1.0 / scale,
+               cv::INTER_AREA);
+    cv::medianBlur(small, small, kernel);
+    cv::resize(small, bg, gray.size(), 0, 0, cv::INTER_LINEAR);
+    cv::Mat diff, out;
+    cv::absdiff(gray, bg, diff);
+    cv::subtract(cv::Scalar(255), diff, out);
+    return out;
   }
 
 private:
@@ -151,6 +209,25 @@ private:
     return api;
   }
 
+  static constexpr int kMaxUpscaledArea = 1000 * 1000;
+
+  static void to_screen(Rect& r, cv::Point offset, double scale,
+                        double shear) {
+    // the shift of the box's middle row undone
+    const int dx = static_cast<int>(shear * (r.y1 + r.y2) / 2);
+    r.x1 = static_cast<int>((r.x1 - dx) / scale) + offset.x;
+    r.x2 = static_cast<int>((r.x2 - dx) / scale) + offset.x;
+    r.y1 = static_cast<int>(r.y1 / scale) + offset.y;
+    r.y2 = static_cast<int>(r.y2 / scale) + offset.y;
+  }
+
+  bool touches_edge(const Rect& r) const {
+    constexpr int margin = 2;
+    return r.x1 <= margin || r.y1 <= margin ||
+           r.x2 >= img_size_.width - 1 - margin ||
+           r.y2 >= img_size_.height - 1 - margin;
+  }
+
   struct Strip {
     cv::Mat img;        // view into the normalized image
     int y0;             // strip offset in the full image
@@ -169,26 +246,6 @@ private:
   // one tesseract instance per core
   static int worker_count() {
     return std::max(1u, std::thread::hardware_concurrency());
-  }
-
-  // Screens mix dark text on light (a white banner, a link preview) and light
-  // text on dark (a dark chat). Text is a minority of pixels around it, so a
-  // large median gives the local background, and the distance to it gives text
-  // of either polarity as dark on light. The median runs on a downscaled copy:
-  // full size is slow.
-  static cv::Mat dark_text_on_light(const cv::Mat& gray) {
-    constexpr int scale = 4;
-    constexpr int kernel = 25; // ~100 px in the full image: wider than a glyph,
-                               // narrower than a panel
-    cv::Mat small, bg;
-    cv::resize(gray, small, cv::Size(), 1.0 / scale, 1.0 / scale,
-               cv::INTER_AREA);
-    cv::medianBlur(small, small, kernel);
-    cv::resize(small, bg, gray.size(), 0, 0, cv::INTER_LINEAR);
-    cv::Mat diff, out;
-    cv::absdiff(gray, bg, diff);
-    cv::subtract(cv::Scalar(255), diff, out);
-    return out;
   }
 
   // Rows where the image is cut into n strips. A cut is placed on the most

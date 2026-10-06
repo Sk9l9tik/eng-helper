@@ -1,6 +1,8 @@
 #ifndef __OLLAMA_CLIENT__
 #define __OLLAMA_CLIENT__
 
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <curl/curl.h>
 
@@ -9,6 +11,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using DataCallback = std::function<bool(const char*, size_t)>;
 
@@ -140,44 +143,26 @@ public:
 
   ~OllamaClient() { curl_global_cleanup(); }
 
-  // Streams two lines: Russian translation of `word` with the meaning it has in
-  // `sentence`, then of the whole sentence. `options` are the dictionary
-  // translations of the word ("банк; берег"): small models pick the right
-  // meaning from a list much better than they come up with it. May be empty.
+  // Streams the Russian translation of `text`: a sentence as HTML with the
+  // clicked word in <b>, which the model often keeps around its translation,
+  // or a single word. The prompt is translategemma's own (plus one line on
+  // tenses): the model is trained on it and needs no examples. Short matters:
+  // the model runs on the CPU and ollama does not reuse the cached prefix for
+  // gemma3 models, so ~90 prompt
+  // tokens take ~2 s before the first word, the old prompt with examples
+  // (~400) took ~8 s. Re-casing ALL CAPS text is up to the caller
+  // (sentence_case), before the tags are added.
   // on_chunk is called with each new piece as it is generated.
   // Thread-safe: every call uses its own CURL handle.
   // If `cancelled` returns true the connection is dropped, which also stops
   // generation in ollama.
-  void translate(const std::string& word, const std::string& sentence,
-                 const std::string& options,
+  // `temperature` above 0 gives another translation on each call
+  void translate(const std::string& text,
                  const std::function<void(const std::string&)>& on_chunk,
-                 std::function<bool()> cancelled = {}) const {
-    chat(message("system", system_prompt) + "," +
-             message("user", "Sentence: I sat on the river bank.\nWord: "
-                             "bank\nDictionary: банк; берег; насыпь") +
-             "," + message("assistant", "берег\nЯ сидел на берегу реки.") +
-             "," +
-             message("user", "Sentence: Do you still live there?\nWord: "
-                             "still\nDictionary: неподвижный; ещё, всё ещё") +
-             "," + message("assistant", "всё ещё\nТы всё ещё там живёшь?") +
-             "," +
-             message("user",
-                     "Sentence: " + sentence + "\nWord: " + word +
-                         "\nDictionary: " + (options.empty() ? "-" : options)),
-         on_chunk, std::move(cancelled));
-  }
-
-  // Streams only the Russian translation of `sentence`.
-  // Fallback for translate(): small models sometimes stop after the first line.
-  void
-  translate_sentence(const std::string& sentence,
-                     const std::function<void(const std::string&)>& on_chunk,
-                     std::function<bool()> cancelled = {}) const {
-    chat(message("system", sentence_prompt) + "," +
-             message("user", "I sat on the river bank.") + "," +
-             message("assistant", "Я сидел на берегу реки.") + "," +
-             message("user", sentence),
-         on_chunk, std::move(cancelled));
+                 std::function<bool()> cancelled = {},
+                 double temperature = 0) const {
+    chat(message("user", prompt + text), on_chunk, std::move(cancelled),
+         temperature);
   }
 
   // Loads the model into memory and keeps it there, so the first real request
@@ -188,6 +173,45 @@ public:
   }
 
 private:
+  static std::string to_lower(std::string s) {
+    for (char& c : s)
+      c = std::tolower(static_cast<unsigned char>(c));
+    return s;
+  }
+
+public:
+  // Comics are written in caps, which small models translate much worse:
+  // "I WILL NOW IMPART THE ARTS." -> "I will now impart the arts."
+  static std::string sentence_case(const std::string& s) {
+    bool has_lower = false, has_upper = false;
+    for (unsigned char c : s) {
+      has_lower |= std::islower(c) != 0;
+      has_upper |= std::isupper(c) != 0;
+    }
+    if (has_lower || !has_upper)
+      return s;
+
+    std::string out = to_lower(s);
+    bool sentence_start = true;
+    for (size_t i = 0; i < out.size(); ++i) {
+      unsigned char c = out[i];
+      if (std::isalpha(c)) {
+        const bool word_start = i == 0 || !std::isalpha((unsigned char)out[i - 1]);
+        const bool lone_i =
+            c == 'i' && word_start &&
+            (i + 1 == out.size() || !std::isalpha((unsigned char)out[i + 1]));
+        if (sentence_start || lone_i)
+          out[i] = std::toupper(c);
+        sentence_start = false;
+      } else if (c == '.' || c == '!' || c == '?') {
+        sentence_start = true;
+      }
+    }
+    return out;
+  }
+
+private:
+
   static std::string message(const char* role, const std::string& content) {
     return R"({"role":")" + std::string(role) + R"(","content":")" +
            escape_json(content) + "\"}";
@@ -196,12 +220,14 @@ private:
   // `messages` is a comma-separated list of message() objects
   void chat(const std::string& messages,
             const std::function<void(const std::string&)>& on_chunk,
-            std::function<bool()> cancelled) const {
-    std::string json =
-        R"({"model":")" + model +
-        R"(","stream":true,"keep_alive":-1,)"
-        R"("options":{"temperature":0,"num_predict":200},"messages":[)" +
-        messages + "]}";
+            std::function<bool()> cancelled, double temperature) const {
+    std::string json = R"({"model":")" + model +
+                       R"(","stream":true,"keep_alive":-1,)"
+                       R"("options":{"temperature":)" +
+                       // not std::to_string: Qt sets the locale, "0,8"
+                       std::to_string(int(temperature)) + "." +
+                       std::to_string(int(temperature * 10) % 10) +
+                       R"(,"num_predict":200},"messages":[)" + messages + "]}";
 
     // ollama streams one JSON object per line:
     // {"message":{"role":"assistant","content":"<piece>"},"done":false}
@@ -271,21 +297,20 @@ private:
   }
 
   std::string apiUrl;
-  std::string model = "gemma3:1b"; // qwen2.5:3b, gemma3:1b, gemma3:4b qwen3:1.7b
-  // Short prompt on purpose: gemma3 does not reuse the cached prefix, so every
-  // prompt token costs time on each request
-  std::string system_prompt =
-      "You are an English-Russian translator. The user gives a sentence, a "
-      "word from it and dictionary translations of the word. Reply with "
-      "exactly two lines:\n"
-      "1) the Russian translation of the word as it is used in this sentence, "
-      "1-3 words, in dictionary form; prefer a dictionary option if one fits\n"
-      "2) a natural, fluent Russian translation of the whole sentence\n"
-      "No labels, no quotes, no other text.";
-  std::string sentence_prompt =
-      "You are an English-Russian translator. Translate the user's English "
-      "sentence into natural, fluent Russian. "
-      "Reply with the translation only.";
+  std::string model = "translategemma:4b"; // qwen2.5:3b, gemma3:1b, gemma3:4b qwen3:1.7b
+  // translategemma's prompt format, the text goes right after it
+  std::string prompt =
+      "You are a professional English (en) to Russian (ru) translator. Your "
+      "goal is to accurately convey the meaning and nuances of the original "
+      "English text while adhering to Russian grammar, vocabulary, and "
+      "cultural sensitivities.\n"
+      // "Sorry for messaging so late" came out as "...что ответил так поздно"
+      "Keep the tense of the original: an -ing form happens at the same time "
+      "as the main verb unless the text says otherwise (\"Sorry for calling so "
+      "late\" is \"Извините, что звоню так поздно\").\n"
+      "Produce only the Russian translation, without any additional "
+      "explanations or commentary. Please translate the following English "
+      "text into Russian:\n\n\n";
 };
 
 #endif // __OLLAMA_CLIENT__

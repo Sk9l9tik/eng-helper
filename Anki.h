@@ -118,9 +118,13 @@ inline AnkiNote make_anki_note(const std::string& word,
 
   if (!word_ru.empty())
     note.in_context = "<b>" + escape_html(word_ru) + "</b>";
-  if (!sentence_ru.empty())
-    note.in_context +=
-        (note.in_context.empty() ? "" : "<br>") + escape_html(sentence_ru);
+  if (!sentence_ru.empty()) {
+    // the model marks the word's translation as "[...]"
+    std::string ru;
+    for (char c : escape_html(sentence_ru))
+      ru += c == '[' ? "<b>" : c == ']' ? "</b>" : std::string(1, c);
+    note.in_context += (note.in_context.empty() ? "" : "<br>") + ru;
+  }
   return note;
 }
 

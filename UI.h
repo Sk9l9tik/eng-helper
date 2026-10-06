@@ -19,6 +19,7 @@
 #include <qapplication.h>
 #include <qpushbutton.h>
 #include <qwidget.h>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -30,12 +31,15 @@
 #include "Audio.h"
 #include "Dictionary.h"
 #include "LLM.h"
+#include "Yandex.h"
 #include "Parser.h"
 
 #undef __MY_LOG__ // disable logs
 
+// `parser` has recognized `area` of the screenshot; it is used again to
+// recognize the area better on request. `cursor` is where the mouse was.
 int draw_interface(QApplication& app, const cv::Mat& screenshot,
-                   const std::vector<Word>& words,
-                   const std::vector<Block>& blocks);
+                   Parser& parser, cv::Rect area,
+                   std::optional<cv::Point> cursor);
 
 #endif // __APPUI__

@@ -87,6 +87,7 @@ set(SOURCES
     Parser.h
     Dictionary.h
     LLM.h
+    Yandex.h
     Anki.h
     Audio.h
 )

@@ -163,6 +163,7 @@ public:
       para_offset += para_count;
     }
     fix_misread_i(words_);
+    stitch_paragraphs(words_);
     build_contexts(words_);
   }
 

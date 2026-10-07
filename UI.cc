@@ -184,6 +184,7 @@ public:
     context_->setText(highlight(context, clean));
     translated_.clear();
     sentence_.clear();
+    highlighted_ = false;
     set_in_context("…");
     translation_->setText("…");
 
@@ -231,6 +232,7 @@ public:
     sentence_only_ = true;
     fixed_word_ = QString::fromStdString(word_ru_);
     sentence_.clear();
+    highlighted_ = false;
     translation_->setText("…");
     set_anki_state(shown_, "Translating…", false);
     retranslate_->setEnabled(false);
@@ -238,6 +240,21 @@ public:
 
   // a translation of the word is found in the sentence
   bool word_found() const { return !word_ru_.empty(); }
+  // ...and highlighted there
+  bool highlighted() const { return highlighted_; }
+  // the translation in the card, without markup
+  std::string sentence() const { return sentence_shown_.toStdString(); }
+
+  // The words the model named as the translation of the word (see
+  // OllamaClient::aligned), if they are in the sentence and not most of it
+  void set_aligned(QString words) {
+    words = words.section('\n', 0, 0).remove("**").remove('"').trimmed();
+    const Span span = find_phrase(sentence_shown_, words);
+    if (!span.len || span.len * 2 > sentence_shown_.size())
+      return;
+    show_result(sentence_shown_, span,
+                sentence_shown_.mid(span.at, span.len).toLower(), true);
+  }
 
   void finish_translation() {
     retranslate_->setEnabled(true);
@@ -365,10 +382,13 @@ public:
     auto [sentence, span] = parse_marked(html, done);
     const QString marked = sentence.mid(span.at, span.len);
 
-    // the dictionary form if the marked word is one of the dictionary words
+    // the dictionary form if the marked word is one of the dictionary words;
+    // not for a phrase: "работа переводчика" stays whole
+    static const QRegularExpression space("\\s+");
     QString word = marked;
     for (const auto& option : options_)
-      if (find_phrase(word, option, true).len) {
+      if (word.split(space).size() == option.split(space).size() &&
+          find_phrase(word, option, true).len) {
         word = option;
         break;
       }
@@ -458,6 +478,7 @@ private:
   void show_result(const QString& sentence, Span span, const QString& word,
                    bool done) {
     sentence_shown_ = sentence;
+    highlighted_ = span.len > 0;
     set_in_context(word.isEmpty() && !done ? "…" : word);
     const QString before = sentence.left(span.at),
                   marked = sentence.mid(span.at, span.len),
@@ -584,6 +605,7 @@ private:
   QRect anchor_;
   QString translated_, sentence_;
   QString sentence_shown_; // the translation in the card, without markup
+  bool highlighted_ = false;
   // dictionary translations, to find the word in the sentence translation
   QStringList options_;
   QLabel *word_, *ipa_, *pos_, *in_context_, *senses_, *context_, *translation_;
@@ -677,6 +699,48 @@ std::vector<std::string> next_words(const std::vector<Word>& words, size_t i) {
     out.push_back(Dictionary::strip_punct(words[j].text));
   }
   return out;
+}
+
+// Most senses of the entry are this part of speech: "job" is a noun, "books"
+// too (one sense of five is a verb)
+bool mostly(const std::optional<DictEntry>& entry, const std::string& pos) {
+  if (!entry || entry->senses.empty())
+    return false;
+  const auto n = std::count_if(entry->senses.begin(), entry->senses.end(),
+                               [&](const Sense& s) { return s.pos == pos; });
+  return size_t(n) * 2 > entry->senses.size();
+}
+
+// The i-th word describes the noun after it: "a notarized interpreting job",
+// "the bus stop". Alone it translates as a fragment of the noun's translation
+// ("переводчика" of "работа переводчика"), so they are translated together.
+// Before it there is an article or an adjective, not a verb: "I like reading
+// books" is not "reading books". `next` are from next_words.
+bool modifies_next(Dictionary& dict, const std::vector<Word>& words, size_t i,
+                   const std::vector<std::string>& next) {
+  auto lower = [](const std::string& s) {
+    return QString::fromStdString(s).toLower().toStdString();
+  };
+  if (next.empty() || i == 0 || words[i - 1].context != words[i].context ||
+      !mostly(dict.lookup(next[0]), "noun"))
+    return false;
+  const std::string word = lower(Dictionary::strip_punct(words[i].text));
+  if (!(word.size() > 4 && word.ends_with("ing")) &&
+      !mostly(dict.lookup(word), "noun"))
+    return false;
+
+  const std::string& before = words[i - 1].text;
+  if (Dictionary::strip_punct(before).size() != before.size())
+    return false; // "late. Reading books"
+  const std::string prev = lower(before);
+  static const char* determiners[] = {
+      "a",    "an",   "the",   "my",    "your", "his",   "her",
+      "its",  "our",  "their", "this",  "that", "these", "those",
+      "some", "any",  "no",    "every", "each", "another"};
+  return std::find(std::begin(determiners), std::end(determiners), prev) !=
+             std::end(determiners) ||
+         prev.ends_with("ed") || // "notarized", not in the dictionary
+         mostly(dict.lookup(prev), "adjective");
 }
 
 // Part of the screen around the word, like a screenshot in a mining card: the
@@ -819,9 +883,34 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
   // Translation of the word shown in the card and its sentence
   struct Request {
     std::string phrase, context;
+    // translations of the sentence shown so far, for "↻"
+    std::vector<std::string> previous;
   };
   auto last = std::make_shared<Request>();
-  auto translate = [popup, request_id](Request r) {
+  // Highlights the words of the sentence translation that the model names as
+  // the word's, if none is highlighted. Called from the translating thread
+  // after the translation is delivered.
+  auto align = [](QPointer<Popup> target, int id,
+                  std::shared_ptr<std::atomic<int>> request_id, auto deliver,
+                  const std::string& sentence_en, const std::string& phrase) {
+    std::string sentence_ru;
+    QMetaObject::invokeMethod(
+        qApp,
+        [&] {
+          if (target && id == *request_id && !target->highlighted())
+            sentence_ru = target->sentence();
+        },
+        Qt::BlockingQueuedConnection);
+    if (sentence_ru.empty())
+      return;
+    const std::string words =
+        client.aligned(marked_md(sentence_en, phrase), sentence_ru, phrase,
+                       [id, request_id] { return id != *request_id; });
+    deliver([words = QString::fromStdString(words)](Popup* p) {
+      p->set_aligned(words);
+    });
+  };
+  auto translate = [popup, request_id, align](Request r) {
     const int id = ++*request_id;
     QPointer<Popup> target = popup;
     auto deliver = [id, request_id, target](auto update) {
@@ -834,7 +923,7 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
           Qt::QueuedConnection);
     };
 
-    std::thread([r = std::move(r), id, request_id, deliver, target]() {
+    std::thread([r = std::move(r), id, request_id, deliver, target, align]() {
       const std::string sentence_en = OllamaClient::sentence_case(
           QString::fromStdString(r.context).simplified().toStdString());
       if (yandex.configured()) {
@@ -867,7 +956,8 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
         deliver([](Popup* p) { p->show_marked_final(); });
 
         // neither marked nor a dictionary translation found in the sentence:
-        // the word alone
+        // the model is asked which words are the word's, then the word alone
+        align(target, id, request_id, deliver, sentence_en, r.phrase);
         bool found = false;
         QMetaObject::invokeMethod(
             qApp,
@@ -896,9 +986,15 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
     }).detach();
   };
 
-  // another translation of the sentence alone, with some randomness: the same
-  // request at temperature 0 would give the same answer
-  popup->on_retranslate = [popup, request_id, last] {
+  // another translation of the sentence alone: the model is shown the previous
+  // ones and asked for a different one (see OllamaClient::translate)
+  popup->on_retranslate = [popup, request_id, last, align] {
+    // the last few are enough to get another one, and the prompt stays short
+    constexpr size_t kMaxPrevious = 3;
+    if (const std::string shown = popup->sentence(); !shown.empty())
+      last->previous.push_back(shown);
+    if (last->previous.size() > kMaxPrevious)
+      last->previous.erase(last->previous.begin());
     popup->restart_sentence();
     const int id = ++*request_id;
     QPointer<Popup> target = popup;
@@ -915,14 +1011,16 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
                      QString::fromStdString(last->context)
                          .simplified()
                          .toStdString()),
-                 phrase = last->phrase, id, request_id, deliver] {
+                 phrase = last->phrase, previous = last->previous, id,
+                 request_id, deliver, target, align] {
       try {
         client.translate(
             marked_md(sentence_en, phrase),
             [&](const std::string& piece) {
               deliver([piece](Popup* p) { p->append_sentence(piece); });
             },
-            [id, request_id] { return id != *request_id; }, 0.8);
+            [id, request_id] { return id != *request_id; }, 0.3, previous);
+        align(target, id, request_id, deliver, sentence_en, phrase);
         deliver([](Popup* p) { p->finish_translation(); });
       } catch (const RequestCancelled&) {
       } catch (const std::exception& e) {
@@ -975,6 +1073,10 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
 
     // "FELL" in "FELL FOR HER" is looked up and translated as "fall for"
     std::string phrase = Dictionary::strip_punct(word);
+    // what is marked in the sentence to translate: "interpreting" of "an
+    // interpreting job" is looked up alone, but translated as "interpreting
+    // job" (modifies_next)
+    std::string marked;
     std::optional<DictEntry> entry;
     if (has_dict) {
       auto next = next_words(*words, i);
@@ -986,11 +1088,13 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
           phrase += " " + next[k];
       } else {
         entry = dictionary.lookup(word);
+        if (modifies_next(dictionary, *words, i, next))
+          marked = phrase + " " + next[0];
       }
     }
     popup->show_word(btn->geometry(), phrase, context, entry, dict_error);
 
-    *last = {phrase, context};
+    *last = {marked.empty() ? phrase : marked, context};
     translate(*last);
   };
 

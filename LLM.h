@@ -156,13 +156,36 @@ public:
   // Thread-safe: every call uses its own CURL handle.
   // If `cancelled` returns true the connection is dropped, which also stops
   // generation in ollama.
-  // `temperature` above 0 gives another translation on each call
+  // `previous`: translations of `text` already shown; the model is asked for
+  // another one in a dialog, like "Переведи по-другому" of Yandex. Temperature
+  // alone gives the same answer almost every time.
   void translate(const std::string& text,
                  const std::function<void(const std::string&)>& on_chunk,
                  std::function<bool()> cancelled = {},
-                 double temperature = 0) const {
-    chat(message("user", prompt + text), on_chunk, std::move(cancelled),
-         temperature);
+                 double temperature = 0,
+                 const std::vector<std::string>& previous = {}) const {
+    std::string messages = message("user", prompt + text);
+    for (const auto& t : previous)
+      messages += "," + message("assistant", t) + "," +
+                  message("user", "Переведи по-другому.");
+    chat(messages, on_chunk, std::move(cancelled), temperature);
+  }
+
+  // Words of `translation` that translate `word` of `text`, for when the model
+  // dropped the **…** around them: "they **sorely** lack" -> "им так не
+  // хватает" -> "так не хватает". May be the whole sentence or wrong words.
+  std::string aligned(const std::string& text, const std::string& translation,
+                      const std::string& word,
+                      std::function<bool()> cancelled = {}) const {
+    std::string out;
+    chat(message("user", prompt + text) + "," +
+             message("assistant", translation) + "," +
+             message("user", "Which words of your translation translate \"" +
+                                 word +
+                                 "\"? Answer with those Russian words only."),
+         [&](const std::string& piece) { out += piece; },
+         std::move(cancelled), 0);
+    return out;
   }
 
   // Loads the model into memory and keeps it there, so the first real request

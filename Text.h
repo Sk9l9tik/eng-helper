@@ -120,6 +120,26 @@ inline bool ends_sentence(const std::string& word) {
   return true;
 }
 
+// "lack..." or "lack…": the sentence may go on ("and then... we left"), so the
+// word after it decides (see starts_sentence)
+inline bool ends_with_ellipsis(const std::string& word) {
+  size_t e = word.find_last_not_of("\"')]»”’");
+  if (e == std::string::npos)
+    return false;
+  const std::string w = word.substr(0, e + 1);
+  return w.ends_with("...") || w.ends_with("\u2026");
+}
+
+// A Capitalized word. In ALL CAPS text (comics) and for "I" the case tells
+// nothing.
+inline bool starts_sentence(const std::string& t) {
+  if (t.empty() || !std::isupper(static_cast<unsigned char>(t[0])) ||
+      std::none_of(t.begin(), t.end(),
+                   [](unsigned char c) { return std::islower(c); }))
+    return false;
+  return t != "I" && !(t.size() > 1 && t[0] == 'I' && t[1] == '\'');
+}
+
 // Does `next` continue the same text as `prev`? OCR engines sometimes put menu
 // buttons, titles and other UI text into one paragraph with the real text, so
 // layout is checked too. `h` is the line height of the clicked word. Line boxes
@@ -149,20 +169,59 @@ inline bool continues(const Word& prev, const Word& next, int h) {
 // A line ended by Enter rather than by wrapping, and a new sentence after it:
 // "Good evening, Alexander," / "Sorry for messaging so late." A wrapped line
 // is full: the next word would not fit at its end. `right` is the right edge
-// of the paragraph. Only a Capitalized next word counts: in ALL CAPS text
-// (comics) and before "I" the case tells nothing.
+// of the paragraph. Only a Capitalized next word counts (starts_sentence).
 inline bool line_break_sentence(const Word& prev, const Word& next, int right) {
   if (next.line.y1 == prev.line.y1 && next.line.y2 == prev.line.y2)
     return false;
-  const std::string& t = next.text;
-  if (t.empty() || !std::isupper(static_cast<unsigned char>(t[0])) ||
-      std::none_of(t.begin(), t.end(),
-                   [](unsigned char c) { return std::islower(c); }))
-    return false;
-  if (t == "I" || (t.size() > 1 && t[0] == 'I' && t[1] == '\''))
+  if (!starts_sentence(next.text))
     return false;
   const int space = (prev.line.y2 - prev.line.y1) / 2;
   return prev.box.x2 + space + (next.box.x2 - next.box.x1) < right;
+}
+
+// The image is recognized in strips (see Parser::process), and words come
+// strip by strip: a paragraph cut by a strip border goes on after the other
+// paragraphs of its strip ("...we'll need to cancel", a column on the right,
+// "tomorrow's classes..."), and its sentence would be cut. A paragraph that
+// continues the text of another one (continues) is moved right after it.
+inline void stitch_paragraphs(std::vector<Word>& words) {
+  struct Run {
+    size_t begin, end; // words of one paragraph, in a row
+  };
+  std::vector<Run> runs;
+  for (size_t i = 0; i < words.size(); ++i)
+    if (i == 0 || words[i].para_id != words[i - 1].para_id)
+      runs.push_back({i, i + 1});
+    else
+      runs.back().end = i + 1;
+
+  auto follows = [&](const Run& prev, const Run& next) {
+    const Word &last = words[prev.end - 1], &head = words[next.begin];
+    const int h = std::max(1, last.line.y2 - last.line.y1);
+    return head.line.y1 > last.line.y1 && continues(last, head, h);
+  };
+  std::vector<bool> used(runs.size(), false);
+  std::vector<Word> out;
+  out.reserve(words.size());
+  for (size_t r = 0; r < runs.size(); ++r) {
+    for (size_t cur = r; cur < runs.size() && !used[cur];) {
+      used[cur] = true;
+      for (size_t k = runs[cur].begin; k < runs[cur].end; ++k)
+        out.push_back(words[k]);
+      // the next one in the order already continues it, or none does
+      size_t next = cur + 1;
+      if (next < runs.size() && !used[next] && follows(runs[cur], runs[next]))
+        cur = next;
+      else {
+        next = runs.size();
+        for (size_t c = cur + 2; c < runs.size() && next == runs.size(); ++c)
+          if (!used[c] && follows(runs[cur], runs[c]))
+            next = c;
+        cur = next;
+      }
+    }
+  }
+  words = std::move(out);
 }
 
 // Context of a word is its sentence: neighbours in the same text up to . ! ?
@@ -180,6 +239,9 @@ inline void build_contexts(std::vector<Word>& words) {
   }
   auto sentence_ends = [&](const Word& prev, const Word& next) {
     if (ends_sentence(prev.text))
+      return true;
+    // "they sorely lack... Donut joined the group"
+    if (ends_with_ellipsis(prev.text) && starts_sentence(next.text))
       return true;
     if (prev.para_id < 0 || next.para_id < 0)
       return false;

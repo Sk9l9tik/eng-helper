@@ -10,19 +10,26 @@
 #include <curl/curl.h>
 
 #include "Dictionary.h"
+#include "WordInfo.h"
 #include "LLM.h" // escape_json, json_string_field
 
 // Card for the Lapis note type (https://github.com/donkuri/lapis), added
-// through AnkiConnect
+// through AnkiConnect. Lapis shows Expression with its reading, the picture,
+// the sentence with the word in <b> (in color), then the definitions:
+// MainDefinition first, Glossary on the next page (arrows)
 struct AnkiNote {
-  std::string word;
+  std::string word;           // dictionary form
   std::string ipa;
-  std::string definitions;  // HTML: English definitions from the dictionary
-  std::string translations; // HTML: Russian translations from the dictionary
-  std::string sentence;     // HTML: context with the word in <b>
-  std::string in_context;   // HTML: translation of the word in this context and
-                            // of the whole sentence
-  std::string audio_path;   // local mp3, empty if none
+  std::string definitions;    // HTML: level, part of speech, style; the
+                              // definition in simple English; synonyms, parts
+  std::string translations;   // HTML: translation in context, Russian
+                              // translations, full English definitions
+  std::string sentence;       // HTML: context with the word in <b>
+  std::string in_context;     // HTML: translation of the word in this context
+                              // and of the whole sentence; forms
+  std::string frequency;      // "CEFR C1", shown in the header
+  std::vector<std::string> tags;
+  std::string audio_path;     // local mp3, empty if none
   std::string picture_base64; // jpeg, empty if none
 };
 
@@ -97,17 +104,83 @@ inline size_t append(void* data, size_t size, size_t n, void* out) {
 
 inline AnkiNote make_anki_note(const std::string& word,
                                const std::optional<DictEntry>& entry,
+                               const WordInfo& info,
                                const std::string& context,
                                const std::string& word_ru,
                                const std::string& sentence_ru) {
   using namespace anki_detail;
   AnkiNote note;
-  note.word = entry ? entry->headword : word;
+  note.word = !info.lemma.empty() ? info.lemma : entry ? entry->headword : word;
   note.ipa = entry ? entry->ipa : "";
-  if (entry) {
-    note.definitions = senses_list(entry->senses, false);
-    note.translations = senses_list(entry->senses, true);
+
+  // Lapis' own tag boxes: "C1" "verb" "past participle" "formal"
+  std::string tags;
+  auto tag = [&](const std::string& t) {
+    if (!t.empty())
+      tags += "<span class=\"tags\">" + escape_html(t) + "</span> ";
+  };
+  tag(info.level);
+  tag(info.pos);
+  tag(info.inflection);
+  for (const auto& l : info.labels)
+    tag(l);
+
+  std::string main;
+  if (!tags.empty())
+    main += "<div style=\"margin-bottom:0.4em\">" + tags + "</div>";
+  // the simple definition, else the dictionary ones
+  if (!info.definition.empty())
+    main += "<div style=\"font-size:1.15em\">" +
+            escape_html(info.definition) + "</div>";
+  else if (!info.glosses.empty())
+    main += "<div>" + escape_html(info.glosses.front()) + "</div>";
+  else if (entry)
+    main += senses_list(entry->senses, false);
+  if (!info.example.empty())
+    main += "<div style=\"opacity:0.7; font-style:italic\">" +
+            escape_html(info.example) + "</div>";
+  if (!info.synonyms.empty()) {
+    std::string list;
+    for (const auto& s : info.synonyms)
+      list += (list.empty() ? "" : ", ") + escape_html(s);
+    main += "<div style=\"margin-top:0.4em; opacity:0.8\">Synonyms: "
+            "<span style=\"font-style:italic\">" +
+            list + "</span></div>";
   }
+  if (!info.components.empty()) {
+    main += "<div style=\"margin-top:0.4em\">";
+    for (const auto& c : info.components)
+      main += "<div><span style=\"font-weight:600\">" + escape_html(c.part) +
+              "</span>" +
+              (c.meaning.empty() ? "" : " — " + escape_html(c.meaning)) +
+              "</div>";
+    main += "</div>";
+  }
+  note.definitions = main;
+
+  // translation in context first, then the dictionaries
+  std::string ru_sentence;
+  if (!sentence_ru.empty())
+    // the model marks the word's translation as "[...]"
+    for (char c : escape_html(sentence_ru))
+      ru_sentence += c == '[' ? "<b>" : c == ']' ? "</b>" : std::string(1, c);
+  std::string gloss;
+  if (!word_ru.empty() || !ru_sentence.empty())
+    gloss += "<div>" +
+             (word_ru.empty() ? "" : "<b>" + escape_html(word_ru) + "</b>") +
+             (!word_ru.empty() && !ru_sentence.empty() ? "<br>" : "") +
+             ru_sentence + "</div>";
+  if (entry)
+    gloss += senses_list(entry->senses, true);
+  if (!info.glosses.empty()) {
+    gloss += "<ol>";
+    for (const auto& g : info.glosses)
+      gloss += "<li>" + escape_html(g) + "</li>";
+    gloss += "</ol>";
+  } else if (entry && !info.definition.empty()) {
+    gloss += senses_list(entry->senses, false);
+  }
+  note.translations = gloss;
 
   size_t at = word.empty() ? std::string::npos : context.find(word);
   note.sentence = at == std::string::npos
@@ -118,13 +191,27 @@ inline AnkiNote make_anki_note(const std::string& word,
 
   if (!word_ru.empty())
     note.in_context = "<b>" + escape_html(word_ru) + "</b>";
-  if (!sentence_ru.empty()) {
-    // the model marks the word's translation as "[...]"
-    std::string ru;
-    for (char c : escape_html(sentence_ru))
-      ru += c == '[' ? "<b>" : c == ']' ? "</b>" : std::string(1, c);
-    note.in_context += (note.in_context.empty() ? "" : "<br>") + ru;
+  if (!ru_sentence.empty())
+    note.in_context += (note.in_context.empty() ? "" : "<br>") + ru_sentence;
+  if (!info.forms.empty()) {
+    std::string forms;
+    for (const auto& f : info.forms)
+      forms += (forms.empty() ? "" : ", ") + escape_html(f);
+    note.in_context +=
+        (note.in_context.empty() ? "" : "<br>") + std::string("Forms: ") + forms;
   }
+
+  if (!info.level.empty())
+    note.frequency = "CEFR " + info.level +
+                     (info.level_estimated ? " (by frequency)" : "");
+  // Anki tags have no spaces: "past participle" is not one
+  note.tags = {"lookupper"};
+  for (const auto& t : {info.level, info.pos})
+    if (!t.empty() && t.find(' ') == std::string::npos)
+      note.tags.push_back(t);
+  for (const auto& l : info.labels)
+    if (l.find(' ') == std::string::npos)
+      note.tags.push_back(l);
   return note;
 }
 
@@ -140,17 +227,22 @@ public:
       return "\"" + std::string(name) + "\":\"" + escape_json(value) + "\"";
     };
     const std::string file = file_stem(n.word);
+    std::string tags;
+    for (const auto& t : n.tags)
+      tags += (tags.empty() ? "\"" : ",\"") + escape_json(t) + "\"";
 
     std::string json =
         R"({"action":"addNote","version":6,"params":{"note":{"deckName":")" +
         escape_json(deck) + R"(","modelName":")" + escape_json(model) +
-        R"(","tags":["lookupper"],"fields":{)" + field("Expression", n.word) +
-        "," + field("ExpressionFurigana", n.word) + "," +
+        R"(","tags":[)" + tags + R"(],"fields":{)" +
+        field("Expression", n.word) + "," +
+        field("ExpressionFurigana", n.word) + "," +
         field("ExpressionReading", n.ipa) + "," +
         field("MainDefinition", n.definitions) + "," +
         field("Glossary", n.translations) + "," +
-        field("Sentence", n.sentence) + "," + field("MiscInfo", n.in_context) +
-        "}";
+        field("Sentence", n.sentence) + "," +
+        field("Frequency", n.frequency) + "," +
+        field("MiscInfo", n.in_context) + "}";
     if (!n.audio_path.empty())
       json += R"(,"audio":[{"path":")" + escape_json(n.audio_path) +
               R"(","filename":"lookupper_)" + file +

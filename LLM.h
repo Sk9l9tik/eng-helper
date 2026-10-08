@@ -188,6 +188,37 @@ public:
     return out;
   }
 
+  // Meaning of `word` in `text` in simple words, and its style, for when the
+  // dictionaries have no simple definition (see Lexicon::apply_model_answer):
+  // "DEFINITION: ...\nSTYLE: Formal". The translation model follows such
+  // requests well enough for the definition; its CEFR levels and word parts
+  // are guesses, those come from the dictionaries only. ~6-10 s on the CPU.
+  std::string explain(const std::string& word, const std::string& pos,
+                      const std::string& text,
+                      std::function<bool()> cancelled = {}) const {
+    std::string out;
+    chat(message("user",
+                 "Explain the English " + (pos.empty() ? "word" : pos) +
+                     " \"" + word + "\" as it is used in this text: \"" +
+                     text +
+                     "\"\nAnswer in English, in exactly these lines:\n"
+                     "DEFINITION: <a learner's dictionary definition of the "
+                     "word in the meaning it has here, not a retelling of the "
+                     "text: one short sentence of very simple, common words, "
+                     "without the word itself>\n"
+                     "STYLE: <Neutral, Formal, Informal, Slang, Technical, "
+                     "Literary or Old-fashioned>\n"
+                     // without an example it retells the sentence: "They
+                     // sorely lack experience" -> "They don't have enough
+                     // experience"
+                     "For example, for \"swiftly\" in \"She swiftly left "
+                     "the room\":\nDEFINITION: In a quick way.\nSTYLE: "
+                     "Neutral"),
+         [&](const std::string& piece) { out += piece; },
+         std::move(cancelled), 0);
+    return out;
+  }
+
   // Loads the model into memory and keeps it there, so the first real request
   // is fast
   void warmup() const {
@@ -331,6 +362,9 @@ private:
       "Keep the tense of the original: an -ing form happens at the same time "
       "as the main verb unless the text says otherwise (\"Sorry for calling so "
       "late\" is \"Извините, что звоню так поздно\").\n"
+      // "Max 5x users" came out as "Максимум 5 пользователям"
+      "Keep product, plan and brand names as they are (\"Max 5x users\" is "
+      "\"пользователи Max 5x\").\n"
       "Produce only the Russian translation, without any additional "
       "explanations or commentary. Please translate the following English "
       "text into Russian:\n\n\n";

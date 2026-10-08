@@ -33,6 +33,7 @@
 #include "LLM.h"
 #include "Yandex.h"
 #include "Parser.h"
+#include "WordInfo.h"
 
 #undef __MY_LOG__ // disable logs
 

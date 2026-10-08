@@ -86,6 +86,7 @@ set(SOURCES
     Text.h
     Parser.h
     Dictionary.h
+    WordInfo.h
     LLM.h
     Yandex.h
     Anki.h

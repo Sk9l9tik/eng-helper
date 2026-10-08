@@ -14,7 +14,14 @@ QLabel { color: #e6e6e6; background: transparent; font-size: 13px; }
 #captionLine { background-color: #44444c; }
 #word { color: white; font-size: 20px; font-weight: 600; }
 #ipa { color: #8a8a93; font-size: 12px; }
-#pos { color: #1c1c20; background-color: #9aa0a6; border-radius: 3px; padding: 0px 4px; font-size: 11px; }
+#chip { color: #c8c8d0; background-color: #2e2e35; border: 1px solid #3a3a42; border-radius: 4px; padding: 1px 6px; font-size: 11px; }
+#level { color: white; border-radius: 4px; padding: 1px 6px; font-size: 11px; font-weight: 600; }
+#inContext { color: white; font-size: 15px; font-weight: 600; }
+#definition { color: #e6e6e6; font-size: 14px; }
+#synonyms { color: #8a8a93; font-size: 12px; }
+#component { background-color: #2a2a30; border: 1px solid #34343c; border-radius: 6px; }
+#componentPart { color: #cfe3ff; font-size: 17px; }
+#componentMeaning { color: #c8c8d0; font-size: 12px; }
 #translation { color: #b8b8c0; }
 #anki { color: #e6e6e6; background-color: #34343c; border: 1px solid #4a4a54; border-radius: 4px; padding: 2px 8px; font-size: 11px; }
 #anki:hover { background-color: #44444c; }
@@ -30,6 +37,22 @@ const char* kSelectedWordStyle =
     "rgb(229, 193, 0); }";
 
 const int kMaxSenses = 3;
+
+// CEFR badge: green for basic words, blue, then purple for advanced ones
+QString level_color(const std::string& level) {
+  if (level.starts_with("A"))
+    return "#3f9d5a";
+  if (level.starts_with("B"))
+    return "#3b78c4";
+  return "#9333ea";
+}
+
+QLabel* make_chip(const QString& text, QWidget* parent,
+                  const char* name = "chip") {
+  auto* chip = new QLabel(text, parent);
+  chip->setObjectName(name);
+  return chip;
+}
 
 QString html(const std::string& s) {
   return QString::fromStdString(s).toHtmlEscaped();
@@ -62,7 +85,7 @@ public:
   explicit Popup(QWidget* parent) : QFrame(parent) {
     setObjectName("popup");
     setStyleSheet(kPopupStyle);
-    setFixedWidth(380);
+    setFixedWidth(420);
 
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(14, 10, 14, 12);
@@ -74,13 +97,7 @@ public:
     head->setSpacing(8);
     word_ = new QLabel(this);
     word_->setObjectName("word");
-    ipa_ = new QLabel(this);
-    ipa_->setObjectName("ipa");
-    pos_ = new QLabel(this);
-    pos_->setObjectName("pos");
     head->addWidget(word_);
-    head->addWidget(ipa_);
-    head->addWidget(pos_);
     head->addStretch();
     anki_ = new QPushButton(this);
     anki_->setObjectName("anki");
@@ -92,10 +109,41 @@ public:
     head->addWidget(anki_);
     layout->addLayout(head);
 
+    // level, transcription, part of speech, form, style
+    auto* chips_row = new QWidget(this);
+    chips_ = new QHBoxLayout(chips_row);
+    chips_->setContentsMargins(0, 0, 0, 0);
+    chips_->setSpacing(6);
+    layout->addWidget(chips_row);
+
     in_context_ = new QLabel(this);
+    in_context_->setObjectName("inContext");
     in_context_->setWordWrap(true);
-    in_context_->setTextFormat(Qt::RichText);
+    in_context_->setTextFormat(Qt::PlainText);
     layout->addWidget(in_context_);
+
+    // the meaning in simple English: the main thing of the card
+    definition_ = new QLabel(this);
+    definition_->setObjectName("definition");
+    definition_->setWordWrap(true);
+    definition_->setTextFormat(Qt::RichText);
+    layout->addWidget(definition_);
+
+    synonyms_ = new QLabel(this);
+    synonyms_->setObjectName("synonyms");
+    synonyms_->setWordWrap(true);
+    synonyms_->setTextFormat(Qt::RichText);
+    layout->addWidget(synonyms_);
+
+    // the parts of the word, a card each
+    components_ = new QWidget(this);
+    auto* components_layout = new QVBoxLayout(components_);
+    components_layout->setContentsMargins(0, 4, 0, 0);
+    components_layout->setSpacing(4);
+    auto* components_caption = new QLabel("Components", components_);
+    components_caption->setObjectName("caption");
+    components_layout->addWidget(components_caption);
+    layout->addWidget(components_);
 
     senses_ = new QLabel(this);
     senses_->setWordWrap(true);
@@ -144,16 +192,21 @@ public:
     hide();
   }
 
+  // `defining`: the definition is asked from the model, set_explanation()
+  // gets the answer
   void show_word(const QRect& anchor, const std::string& word,
                  const std::string& context,
-                 const std::optional<DictEntry>& entry,
-                 const QString& dict_error) {
+                 const std::optional<DictEntry>& entry, const WordInfo& info,
+                 bool defining, const QString& dict_error) {
     anchor_ = anchor;
     const std::string clean = Dictionary::strip_punct(word);
     ++shown_;
     word_text_ = clean;
     context_text_ = QString::fromStdString(context).simplified().toStdString();
     entry_ = entry;
+    info_ = info;
+    defining_ = defining;
+    translating_ = true;
     options_ = dict_options(entry);
     word_ru_.clear();
     sentence_ru_.clear();
@@ -163,14 +216,21 @@ public:
     set_anki_state(shown_, "Translating…", false);
     retranslate_->setEnabled(false);
 
-    word_->setText(QString::fromStdString(entry ? entry->headword : clean));
-    ipa_->setText(entry ? QString::fromStdString(entry->ipa) : "");
-    ipa_->setVisible(entry && !entry->ipa.empty());
+    word_->setText(QString::fromStdString(
+        !info.lemma.empty() ? info.lemma : entry ? entry->headword : clean));
 
     const auto senses = pick_senses(entry);
-    pos_->setText(senses.empty() ? ""
-                                 : QString::fromStdString(senses.front().pos));
-    pos_->setVisible(!senses.empty() && !senses.front().pos.empty());
+    if (info_.pos.empty() && !senses.empty())
+      info_.pos = senses.front().pos;
+    show_chips();
+    show_definition();
+
+    synonyms_->setVisible(!info.synonyms.empty());
+    QStringList synonyms;
+    for (const auto& w : info.synonyms)
+      synonyms << QString::fromStdString(w).toHtmlEscaped();
+    synonyms_->setText("Synonyms: <i>" + synonyms.join(", ") + "</i>");
+    show_components();
 
     if (!dict_error.isEmpty())
       senses_->setText("<span style='color:#d08770'>" +
@@ -179,7 +239,7 @@ public:
       senses_->setText(
           "<span style='color:#8a8a93'>Not found in the dictionary</span>");
     else
-      senses_->setText(senses_html(senses));
+      senses_->setText(senses_html(senses, info_.pos));
 
     context_->setText(highlight(context, clean));
     translated_.clear();
@@ -234,7 +294,8 @@ public:
     sentence_.clear();
     highlighted_ = false;
     translation_->setText("…");
-    set_anki_state(shown_, "Translating…", false);
+    translating_ = true;
+    update_anki_state();
     retranslate_->setEnabled(false);
   }
 
@@ -260,8 +321,25 @@ public:
     retranslate_->setEnabled(true);
     if (word_ru_.empty())
       set_in_context("");
-    set_anki_state(shown_, "+ Anki", true);
+    translating_ = false;
+    update_anki_state();
   }
+
+  // the model's definition and style (Lexicon::apply_model_answer); empty if
+  // it failed: the dictionary definitions stay
+  void set_explanation(const std::string& answer) {
+    Lexicon::apply_model_answer(info_, answer);
+    defining_ = false;
+    show_chips();
+    show_definition();
+    update_anki_state();
+    adjustSize();
+    place();
+  }
+
+  // the definition is still being asked
+  bool defining() const { return defining_; }
+  const WordInfo& info() const { return info_; }
 
   // `shown` is what shown() returned when the request started: a newer word
   // ignores stale results
@@ -283,11 +361,13 @@ public:
 
   int shown() const { return shown_; }
   AnkiNote note() const {
-    return make_anki_note(word_text_, entry_, context_text_, word_ru_,
+    return make_anki_note(word_text_, entry_, info_, context_text_, word_ru_,
                           sentence_ru_);
   }
   std::string headword() const {
-    return entry_ ? entry_->headword : word_text_;
+    return !info_.lemma.empty() ? info_.lemma
+           : entry_             ? entry_->headword
+                                : word_text_;
   }
 
   void set_translation_error(const QString& error) {
@@ -307,10 +387,94 @@ protected:
 private:
   void set_in_context(const QString& word_ru) {
     in_context_->setVisible(!word_ru.isEmpty());
-    in_context_->setText(
-        "<span style='color:#8a8a93; font-size:11px'>In this context:</span> "
-        "<span style='color:#e5c100; font-size:15px; font-weight:600'>" +
-        word_ru.toHtmlEscaped() + "</span>");
+    in_context_->setText(word_ru);
+    in_context_->setToolTip("Translation in this context");
+  }
+
+  // the card is added once both the translation and the definition are there
+  void update_anki_state() {
+    set_anki_state(shown_,
+                   translating_ ? "Translating…"
+                   : defining_  ? "Defining…"
+                                : "+ Anki",
+                   !translating_ && !defining_);
+  }
+
+  void show_chips() {
+    while (QLayoutItem* item = chips_->takeAt(0)) {
+      delete item->widget();
+      delete item;
+    }
+    QWidget* row = chips_->parentWidget();
+    if (!info_.level.empty()) {
+      auto* level = make_chip(QString::fromStdString(info_.level), row, "level");
+      level->setStyleSheet("background-color:" + level_color(info_.level));
+      level->setToolTip(info_.level_estimated
+                            ? "CEFR level, estimated from the word's frequency"
+                            : "CEFR level");
+      chips_->addWidget(level);
+    }
+    if (entry_ && !entry_->ipa.empty()) {
+      auto* ipa = new QLabel(QString::fromStdString(entry_->ipa), row);
+      ipa->setObjectName("ipa");
+      chips_->addWidget(ipa);
+    }
+    auto chip = [&](const std::string& text, const QString& tooltip) {
+      if (text.empty())
+        return;
+      QString t = QString::fromStdString(text);
+      t[0] = t[0].toUpper();
+      auto* c = make_chip(t, row);
+      c->setToolTip(tooltip);
+      chips_->addWidget(c);
+    };
+    chip(info_.pos, "Part of speech");
+    chip(info_.inflection, "Form of " + QString::fromStdString(info_.lemma));
+    for (const auto& l : info_.labels)
+      chip(l, "Style");
+    chips_->addStretch();
+  }
+
+  void show_definition() {
+    QString text;
+    if (!info_.definition.empty())
+      text = QString::fromStdString(info_.definition).toHtmlEscaped();
+    else if (defining_)
+      text = "<span style='color:#8a8a93'>Defining…</span>";
+    else if (!info_.glosses.empty())
+      text = QString::fromStdString(info_.glosses.front()).toHtmlEscaped();
+    if (!text.isEmpty() && !info_.example.empty())
+      text += "<br><span style='color:#8a8a93; font-size:12px'><i>" +
+              QString::fromStdString(info_.example).toHtmlEscaped() +
+              "</i></span>";
+    definition_->setVisible(!text.isEmpty());
+    definition_->setText(text);
+  }
+
+  void show_components() {
+    auto* layout = static_cast<QVBoxLayout*>(components_->layout());
+    // the caption stays
+    while (layout->count() > 1) {
+      QLayoutItem* item = layout->takeAt(1);
+      delete item->widget();
+      delete item;
+    }
+    for (const auto& c : info_.components) {
+      auto* card = new QFrame(components_);
+      card->setObjectName("component");
+      auto* row = new QHBoxLayout(card);
+      row->setContentsMargins(10, 4, 10, 4);
+      row->setSpacing(10);
+      auto* part = new QLabel(QString::fromStdString(c.part), card);
+      part->setObjectName("componentPart");
+      auto* meaning = new QLabel(QString::fromStdString(c.meaning), card);
+      meaning->setObjectName("componentMeaning");
+      meaning->setWordWrap(true);
+      row->addWidget(part);
+      row->addWidget(meaning, 1);
+      layout->addWidget(card);
+    }
+    components_->setVisible(!info_.components.empty());
   }
 
   // senses that have Russian translations first; only the first few are shown
@@ -327,7 +491,9 @@ private:
     return out;
   }
 
-  static QString senses_html(const std::vector<Sense>& senses) {
+  // `info_pos` is shown in the chips already
+  static QString senses_html(const std::vector<Sense>& senses,
+                             const std::string& info_pos) {
     QString out;
     for (size_t i = 0; i < senses.size(); ++i) {
       const auto& s = senses[i];
@@ -335,15 +501,16 @@ private:
       for (const auto& t : s.translations)
         ru << QString::fromStdString(t);
 
-      QString def = QString::fromStdString(s.definition);
+      // the English definition only where there is no translation
+      QString def = ru.isEmpty() ? QString::fromStdString(s.definition) : "";
       if (def.size() > 140)
         def = def.left(137) + "…";
 
       out += "<div style='margin-bottom:6px'>";
       if (!ru.isEmpty())
-        out += "<span style='color:white; font-size:14px; font-weight:600'>" +
+        out += "<span style='color:#c8c8d0; font-size:13px'>" +
                ru.join(", ").toHtmlEscaped() + "</span>";
-      if (i > 0 && s.pos != senses[i - 1].pos && !s.pos.empty())
+      if (s.pos != (i > 0 ? senses[i - 1].pos : info_pos) && !s.pos.empty())
         out += " <span style='color:#8a8a93; font-size:11px'>" + html(s.pos) +
                "</span>";
       if (!def.isEmpty())
@@ -364,7 +531,7 @@ private:
     if (at < 0)
       return text.toHtmlEscaped();
     return text.left(at).toHtmlEscaped() +
-           "<span style='background-color:#e5c100; color:#111'>" +
+           "<span style='color:#e5c100; font-weight:600'>" +
            w.toHtmlEscaped() + "</span>" +
            text.mid(at + w.size()).toHtmlEscaped();
   }
@@ -608,7 +775,10 @@ private:
   bool highlighted_ = false;
   // dictionary translations, to find the word in the sentence translation
   QStringList options_;
-  QLabel *word_, *ipa_, *pos_, *in_context_, *senses_, *context_, *translation_;
+  QLabel *word_, *in_context_, *definition_, *synonyms_, *senses_, *context_,
+      *translation_;
+  QHBoxLayout* chips_;
+  QWidget* components_;
   QPushButton *anki_, *retranslate_, *improve_;
   // "↻": only the sentence is translated again, the word in context stays
   bool sentence_only_ = false;
@@ -618,6 +788,9 @@ private:
   int shown_ = 0;
   std::string word_text_, context_text_, word_ru_, sentence_ru_;
   std::optional<DictEntry> entry_;
+  WordInfo info_;
+  // the card waits for both
+  bool translating_ = false, defining_ = false;
 };
 
 // Fullscreen transparent overlay: Esc closes the app, click on empty space
@@ -701,6 +874,10 @@ std::vector<std::string> next_words(const std::vector<Word>& words, size_t i) {
   return out;
 }
 
+std::string entry_headword(const std::optional<DictEntry>& entry) {
+  return entry ? entry->headword : "";
+}
+
 // Most senses of the entry are this part of speech: "job" is a noun, "books"
 // too (one sense of five is a verb)
 bool mostly(const std::optional<DictEntry>& entry, const std::string& pos) {
@@ -747,7 +924,8 @@ bool modifies_next(Dictionary& dict, const std::vector<Word>& words, size_t i,
 // lines of its paragraph and sentence (at most a few above and below), with the
 // word underlined
 std::string picture_base64(const cv::Mat& screen,
-                           const std::vector<Word>& words, size_t i) {
+                           const std::vector<Word>& words, size_t i,
+                           size_t count = 1) {
   const Word& w = words[i];
   const int h = std::max(1, w.line.y2 - w.line.y1);
   const int max_above = 4 * h, max_below = 4 * h;
@@ -774,9 +952,13 @@ std::string picture_base64(const cv::Mat& screen,
 
   cv::Mat pic = screen(roi).clone();
   const int thickness = std::max(2, h / 8);
-  const int y = w.box.y2 + thickness - roi.y;
-  cv::line(pic, {w.box.x1 - roi.x, y}, {w.box.x2 - roi.x, y},
-           cv::Scalar(0, 215, 255), thickness);
+  // "roll out": each word of the phrase, they may be on different lines
+  for (size_t k = i; k < std::min(words.size(), i + count); ++k) {
+    const auto& b = words[k].box;
+    const int y = b.y2 + thickness - roi.y;
+    cv::line(pic, {b.x1 - roi.x, y}, {b.x2 - roi.x, y},
+             cv::Scalar(0, 215, 255), thickness);
+  }
 
   constexpr int max_width = 800;
   if (pic.cols > max_width)
@@ -815,6 +997,11 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
           : QString::fromStdString("Dictionary not found: " + dict_path +
                                    ".ifo");
 
+  // simple definitions, level, style, word parts; missing until
+  // tools/fetch_dictionaries.py is run again
+  static Lexicon lexicon;
+  lexicon.load(data_dir());
+
   Overlay window;
   window.setWindowTitle("LookUpper");
   window.setAttribute(Qt::WA_TranslucentBackground);
@@ -836,16 +1023,28 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
   auto request_id = std::make_shared<std::atomic<int>>(0);
   auto selected = std::make_shared<QPointer<QPushButton>>();
   auto selected_word = std::make_shared<size_t>(0);
+  // the other words of a phrasal verb: "out" of "roll out"
+  auto selected_rest = std::make_shared<std::vector<QPointer<QPushButton>>>();
+  auto unselect = [selected, selected_rest] {
+    if (*selected)
+      (*selected)->setStyleSheet(kWordStyle);
+    for (auto& b : *selected_rest)
+      if (b)
+        b->setStyleSheet(kWordStyle);
+    selected_rest->clear();
+  };
 
   static Pronunciations pronunciations(data_dir() + "/audio");
   static AnkiClient anki;
 
-  popup->on_add_to_anki = [popup, selected_word, &screenshot, words] {
+  popup->on_add_to_anki = [popup, selected_word, selected_rest, &screenshot,
+                           words] {
     const int shown = popup->shown();
     popup->set_anki_state(shown, "Adding…", false);
 
     AnkiNote note = popup->note();
-    note.picture_base64 = picture_base64(screenshot, *words, *selected_word);
+    note.picture_base64 = picture_base64(screenshot, *words, *selected_word,
+                                         1 + selected_rest->size());
 
     QPointer<Popup> target = popup;
     std::thread([note = std::move(note), word = popup->headword(), shown,
@@ -873,11 +1072,10 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
     }).detach();
   };
 
-  window.on_background_click = [popup, selected, request_id] {
+  window.on_background_click = [popup, request_id, unselect] {
     popup->hide();
     ++*request_id; // cancels the translation in progress
-    if (*selected)
-      (*selected)->setStyleSheet(kWordStyle);
+    unselect();
   };
 
   // Translation of the word shown in the card and its sentence
@@ -885,6 +1083,9 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
     std::string phrase, context;
     // translations of the sentence shown so far, for "↻"
     std::vector<std::string> previous;
+    // the word to ask the definition of (see OllamaClient::explain), empty if
+    // the dictionaries have one
+    std::string define, define_pos;
   };
   auto last = std::make_shared<Request>();
   // Highlights the words of the sentence translation that the model names as
@@ -910,7 +1111,24 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
       p->set_aligned(words);
     });
   };
-  auto translate = [popup, request_id, align](Request r) {
+  // The definition in simple words from the model, after the translation: one
+  // model on the CPU answers one request at a time. With Yandex too: it only
+  // translates. Called from the translating thread.
+  auto explain = [](int id, std::shared_ptr<std::atomic<int>> request_id,
+                    auto deliver, const std::string& word,
+                    const std::string& pos, const std::string& sentence_en) {
+    std::string answer;
+    try {
+      answer = client.explain(word, pos, sentence_en,
+                              [id, request_id] { return id != *request_id; });
+    } catch (const RequestCancelled&) {
+      return;
+    } catch (const std::exception& e) {
+      std::cerr << "explain: " << e.what() << "\n";
+    }
+    deliver([answer](Popup* p) { p->set_explanation(answer); });
+  };
+  auto translate = [popup, request_id, align, explain](Request r) {
     const int id = ++*request_id;
     QPointer<Popup> target = popup;
     auto deliver = [id, request_id, target](auto update) {
@@ -923,7 +1141,8 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
           Qt::QueuedConnection);
     };
 
-    std::thread([r = std::move(r), id, request_id, deliver, target, align]() {
+    std::thread([r = std::move(r), id, request_id, deliver, target, align,
+                 explain]() {
       const std::string sentence_en = OllamaClient::sentence_case(
           QString::fromStdString(r.context).simplified().toStdString());
       if (yandex.configured()) {
@@ -934,6 +1153,9 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
             p->show_marked(html);
             p->finish_translation();
           });
+          if (!r.define.empty())
+            explain(id, request_id, deliver, r.define, r.define_pos,
+                    sentence_en);
           return;
         } catch (const std::exception& e) {
           // the local model translates instead
@@ -977,24 +1199,30 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
                       Popup* p) { p->set_word_translation(word); });
         }
         deliver([](Popup* p) { p->finish_translation(); });
+        if (!r.define.empty())
+          explain(id, request_id, deliver, r.define, r.define_pos, sentence_en);
       } catch (const RequestCancelled&) {
       } catch (const std::exception& e) {
         deliver([msg = QString::fromStdString(e.what())](Popup* p) {
           p->set_translation_error(msg);
         });
+        if (!r.define.empty())
+          explain(id, request_id, deliver, r.define, r.define_pos, sentence_en);
       }
     }).detach();
   };
 
   // another translation of the sentence alone: the model is shown the previous
   // ones and asked for a different one (see OllamaClient::translate)
-  popup->on_retranslate = [popup, request_id, last, align] {
+  popup->on_retranslate = [popup, request_id, last, align, explain] {
     // the last few are enough to get another one, and the prompt stays short
     constexpr size_t kMaxPrevious = 3;
     if (const std::string shown = popup->sentence(); !shown.empty())
       last->previous.push_back(shown);
     if (last->previous.size() > kMaxPrevious)
       last->previous.erase(last->previous.begin());
+    // "↻" cancels the definition still being asked: asked again after it
+    const bool define = popup->defining();
     popup->restart_sentence();
     const int id = ++*request_id;
     QPointer<Popup> target = popup;
@@ -1012,7 +1240,8 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
                          .simplified()
                          .toStdString()),
                  phrase = last->phrase, previous = last->previous, id,
-                 request_id, deliver, target, align] {
+                 request_id, deliver, target, align, explain, define,
+                 word = last->define, pos = last->define_pos] {
       try {
         client.translate(
             marked_md(sentence_en, phrase),
@@ -1022,6 +1251,8 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
             [id, request_id] { return id != *request_id; }, 0.3, previous);
         align(target, id, request_id, deliver, sentence_en, phrase);
         deliver([](Popup* p) { p->finish_translation(); });
+        if (define)
+          explain(id, request_id, deliver, word, pos, sentence_en);
       } catch (const RequestCancelled&) {
       } catch (const std::exception& e) {
         deliver([msg = QString::fromStdString(e.what())](Popup* p) {
@@ -1048,8 +1279,9 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
                   std::max(0, at.y() - improve->height() - 12));
   }
 
-  auto on_word_click = [popup, request_id, selected, selected_word, words,
-                        translate, last, improve,
+  auto on_word_click = [popup, request_id, selected, selected_word,
+                        selected_rest, unselect, words, buttons, translate,
+                        last, improve,
                         &dict_error](QPushButton* btn, size_t i) {
     improve->hide();
     const std::string ocr_word = (*words)[i].text,
@@ -1058,8 +1290,7 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
     std::cout << "------>" << ocr_word << " | " << ocr_context << "\n\n";
 #endif
 
-    if (*selected)
-      (*selected)->setStyleSheet(kWordStyle);
+    unselect();
     *selected = btn;
     *selected_word = i;
     btn->setStyleSheet(kSelectedWordStyle);
@@ -1082,19 +1313,43 @@ int draw_interface(QApplication& app, const cv::Mat& screenshot,
       auto next = next_words(*words, i);
       for (auto& w : next)
         w = dictionary.correct_word(w);
+      size_t taken = 0;
       if (auto phrasal = dictionary.lookup_phrasal(word, next)) {
         entry = std::move(phrasal->first);
-        for (size_t k = 0; k < phrasal->second; ++k)
-          phrase += " " + next[k];
+        taken = phrasal->second;
+      } else if (auto wikt = lexicon.lookup_phrasal(
+                     phrase, next,
+                     entry_headword(dictionary.lookup(word)))) {
+        // "roll out": Wiktionary has it, the Russian dictionary not; its
+        // entry for "roll" would be the wrong word
+        entry = dictionary.lookup(wikt->first);
+        taken = wikt->second;
       } else {
         entry = dictionary.lookup(word);
         if (modifies_next(dictionary, *words, i, next))
           marked = phrase + " " + next[0];
       }
+      // the whole phrase is highlighted, looked up and translated
+      for (size_t k = 0; k < taken; ++k) {
+        phrase += " " + next[k];
+        if (i + 1 + k < buttons->size()) {
+          QPushButton* b = (*buttons)[i + 1 + k];
+          b->setStyleSheet(kSelectedWordStyle);
+          selected_rest->push_back(b);
+        }
+      }
     }
-    popup->show_word(btn->geometry(), phrase, context, entry, dict_error);
+    // the word before, to tell "a book" from "to book"
+    std::string prev;
+    if (i > 0 && (*words)[i - 1].context == (*words)[i].context)
+      prev = Dictionary::strip_punct((*words)[i - 1].text);
+    WordInfo info = lexicon.lookup(phrase, prev, entry ? entry->headword : "");
+    const bool define = info.needs_model();
+    popup->show_word(btn->geometry(), phrase, context, entry, info, define,
+                     dict_error);
 
-    *last = {marked.empty() ? phrase : marked, context};
+    *last = {marked.empty() ? phrase : marked, context, {},
+             define ? info.lemma : "", info.pos};
     translate(*last);
   };
 
